@@ -1,0 +1,32 @@
+name: cv_discovery
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  # ── Core numerics ──
+  - numpy>=1.24
+  - scipy>=1.10
+  - scikit-learn>=1.3
+  # ── MD I/O ──
+  - mdanalysis>=2.6
+  - mdtraj>=1.9
+  # ── Plotting ──
+  - matplotlib>=3.7
+  # ── pip-only packages ──
+  - pip
+  - pip:
+      # PyTorch 2.7.1 with CUDA 12.8
+      - torch==2.7.1 --index-url https://download.pytorch.org/whl/cu128
+      - torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu128
+      - torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu128
+      # ── PyG (pure-PyTorch fallbacks used; no compiled extensions needed) ──
+      - torch_geometric>=2.4
+      - deeptime>=0.4
+      - mlcolvar>=0.3
+      - lightning>=2.1
+      - e3nn>=0.5
+      - pydiffmap>=0.2
+      - umap-learn>=0.5
+      - -e .          # install this project in editable mode
+
