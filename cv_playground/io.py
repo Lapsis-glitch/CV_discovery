@@ -63,6 +63,11 @@ class TrajectoryFeatures:
     n_atoms: int = 0
     frame_indices: np.ndarray = field(default_factory=lambda: np.array([]))
     colorings: dict = field(default_factory=dict)
+    # Full-protein coords (all heavy + H atoms in the "protein" selection),
+    # kept alongside the selection-only ``coords_3d`` so basin representative
+    # PDBs can include the full structure rather than just Cα.
+    protein_coords_3d: np.ndarray = field(default_factory=lambda: np.zeros((0, 0, 3), dtype=np.float32))
+    protein_selection: str = "protein"
 
     # ---- canonical featurization accessors (for readability in scripts) ----
     @property
@@ -122,11 +127,15 @@ def _compute_dihedrals(u: mda.Universe, frame_indices: np.ndarray) -> np.ndarray
             raise ValueError("No protein atoms for dihedral computation.")
 
         rama = Ramachandran(protein).run(frames=frame_indices)
-        angles_deg = rama.results.angles
+        angles_deg = rama.results.angles           # (n_frames, n_res, 2) = (φ, ψ)
         angles_rad = np.deg2rad(angles_deg)
-        sin_vals = np.sin(angles_rad)
-        cos_vals = np.cos(angles_rad)
-        combined = np.concatenate([sin_vals, cos_vals], axis=-1)
+        phi = angles_rad[..., 0]
+        psi = angles_rad[..., 1]
+        # Per-residue layout: [sin φ, cos φ, sin ψ, cos ψ]
+        combined = np.stack(
+            [np.sin(phi), np.cos(phi), np.sin(psi), np.cos(psi)],
+            axis=-1,
+        )
         return combined.reshape(len(frame_indices), -1).astype(np.float32)
     except Exception as exc:
         logger.warning("Dihedral computation failed (%s); returning zeros.", exc)
@@ -242,7 +251,11 @@ def featurize(
     n_atoms = len(ag)
     n_pairs = n_atoms * (n_atoms - 1) // 2
 
+    protein_ag = u.select_atoms("protein")
+    n_protein = len(protein_ag)
     coords = np.empty((n_frames, n_atoms, 3), dtype=np.float32)
+    protein_coords = np.empty((n_frames, n_protein, 3), dtype=np.float32) \
+        if n_protein > 0 else np.zeros((n_frames, 0, 3), dtype=np.float32)
     dist_arr = np.empty((n_frames, n_pairs), dtype=np.float32)
     rmsd_arr = np.empty(n_frames, dtype=np.float32)
     rg_arr = np.empty(n_frames, dtype=np.float32)
@@ -259,6 +272,8 @@ def featurize(
         u.trajectory[int(fi)]
         pos = ag.positions.copy()
         coords[idx] = pos
+        if n_protein > 0:
+            protein_coords[idx] = protein_ag.positions.copy()
         dist_arr[idx] = distances.self_distance_array(pos)
 
         diff = pos - ref_pos
@@ -315,4 +330,95 @@ def featurize(
         n_atoms=n_atoms,
         frame_indices=all_indices,
         colorings=colorings,
+        protein_coords_3d=protein_coords,
+        protein_selection="protein",
     )
+
+
+# ---------------------------------------------------------------------------
+# Featurization cache (so --read can skip MDAnalysis entirely)
+# ---------------------------------------------------------------------------
+
+def _cache_key(top: str, traj: str, stride: int, selection: str,
+               native: str | None, contact_cutoff: float) -> str:
+    from pathlib import Path as _P
+    parts = [
+        _P(top).stem,
+        _P(traj).stem,
+        f"stride{stride}",
+        selection.replace(" ", "_").replace(":", "-"),
+        _P(native).stem if native else "frame0",
+        f"cutoff{contact_cutoff}",
+    ]
+    return "__".join(parts)
+
+
+def featurize_cached(
+    top: str,
+    traj: str,
+    stride: int = 1,
+    selection: str = "protein and name CA",
+    contact_cutoff: float = 8.0,
+    native: str | None = None,
+    cache_dir: str | None = "outputs/cache",
+    read_cache: bool = False,
+) -> TrajectoryFeatures:
+    """:func:`featurize` with a numpy-archive cache.
+
+    When ``read_cache=True`` and the cache file exists, the trajectory is
+    *not* re-read with MDAnalysis. Cache key is derived from topology /
+    trajectory basename, stride, selection, native reference and contact
+    cutoff, so changing any of those invalidates the cache automatically.
+    """
+    from pathlib import Path as _P
+    if cache_dir is None:
+        return featurize(top, traj, stride, selection, contact_cutoff, native)
+
+    cdir = _P(cache_dir)
+    cdir.mkdir(parents=True, exist_ok=True)
+    key = _cache_key(top, traj, stride, selection, native, contact_cutoff)
+    cache_path = cdir / f"{key}.npz"
+
+    if read_cache and cache_path.exists():
+        logger.info("Loading featurized trajectory from cache: %s", cache_path)
+        data = np.load(str(cache_path), allow_pickle=False)
+        labels = [str(s) for s in data["coloring_labels"].tolist()]
+        colorings = {lab: data[f"coloring_{i}"] for i, lab in enumerate(labels)}
+        return TrajectoryFeatures(
+            cartesian=data["cartesian"],
+            coords_3d=data["coords_3d"],
+            distances=data["distances"],
+            dihedrals=data["dihedrals"],
+            contacts=data["contacts"],
+            rmsd=data["rmsd"],
+            n_atoms=int(data["n_atoms"]),
+            frame_indices=data["frame_indices"],
+            colorings=colorings,
+            protein_coords_3d=data["protein_coords_3d"]
+                if "protein_coords_3d" in data.files
+                else np.zeros((0, 0, 3), dtype=np.float32),
+            protein_selection=str(data["protein_selection"])
+                if "protein_selection" in data.files else "protein",
+        )
+
+    feat = featurize(top, traj, stride, selection, contact_cutoff, native)
+
+    save_kwargs: dict = {
+        "cartesian":     feat.cartesian,
+        "coords_3d":     feat.coords_3d,
+        "distances":     feat.distances,
+        "dihedrals":     feat.dihedrals,
+        "contacts":      feat.contacts,
+        "rmsd":          feat.rmsd,
+        "n_atoms":       np.asarray(feat.n_atoms),
+        "frame_indices": feat.frame_indices,
+        "protein_coords_3d": feat.protein_coords_3d,
+        "protein_selection": np.asarray(feat.protein_selection),
+    }
+    labels = list(feat.colorings.keys())
+    save_kwargs["coloring_labels"] = np.asarray(labels)
+    for i, lab in enumerate(labels):
+        save_kwargs[f"coloring_{i}"] = feat.colorings[lab]
+    np.savez_compressed(str(cache_path), **save_kwargs)
+    logger.info("Cached featurized trajectory → %s", cache_path)
+    return feat

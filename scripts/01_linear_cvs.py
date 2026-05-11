@@ -19,8 +19,9 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from cv_playground.io import featurize
+from cv_playground.io import featurize_cached
 from cv_playground.utils import (
+    attach_committor,
     base_argparser,
     get_or_make_labels,
     log_effective_tau,
@@ -36,16 +37,24 @@ SUBSECTION = "01_linear_cvs"
 def run(args, feat=None) -> None:
     set_seed(args.seed)
     if feat is None:
-        feat = featurize(args.top, args.traj, args.stride, args.selection, native=args.native)
+        feat = featurize_cached(args.top, args.traj, args.stride, args.selection, native=args.native, cache_dir=getattr(args, "cache_dir", "outputs/cache"), read_cache=getattr(args, "read", False))
     out = Path(args.output_dir) / SUBSECTION
+    attach_committor(feat)
     fi = feat.colorings
     log_effective_tau(args, "script 01 tICA")
     set_run_context(feat=feat, args=args, interpret_mode="pearson")
 
     # ── 1. PCA on aligned Cartesians ────────────────────────────────────────
+    # Native input is flattened Cartesians → axis-sweep PDP in xyz space.
     def pca_cartesian():
         from sklearn.decomposition import PCA
-        return PCA(n_components=2, random_state=args.seed).fit_transform(feat.cartesian)
+        m = PCA(n_components=2, random_state=args.seed).fit(feat.cartesian)
+
+        def _tf(coords3d):
+            X = np.asarray(coords3d).reshape(len(coords3d), -1)
+            return m.transform(X)
+
+        return m.transform(feat.cartesian), _tf, "cartesian"
 
     run_method("PCA Cartesian", pca_cartesian, fi, out)
 
@@ -53,7 +62,7 @@ def run(args, feat=None) -> None:
     def tica_distances():
         from deeptime.decomposition import TICA
         model = TICA(lagtime=args.lag, dim=2).fit_fetch(feat.distances)
-        return model.transform(feat.distances)
+        return model.transform(feat.distances), lambda X: model.transform(X)
 
     run_method("tICA (Cα distances)", tica_distances, fi, out)
 
@@ -65,17 +74,27 @@ def run(args, feat=None) -> None:
         labels = get_or_make_labels(args, feat)
         n_classes = len(np.unique(labels))
 
-        X = feat.distances
+        X_raw = feat.distances
+        pca50 = None
+        X = X_raw
         if X.shape[1] > 50:
-            X = PCA(n_components=50, random_state=args.seed).fit_transform(X)
+            pca50 = PCA(n_components=50, random_state=args.seed).fit(X_raw)
+            X = pca50.transform(X_raw)
 
         n_comp = min(2, n_classes - 1)
         lda = LinearDiscriminantAnalysis(n_components=n_comp)
         proj = lda.fit_transform(X, labels)
 
+        def _transform(Xnew):
+            Z = pca50.transform(Xnew) if pca50 is not None else Xnew
+            p = lda.transform(Z)
+            if p.shape[1] == 1:
+                p = np.column_stack([p[:, 0], np.zeros(len(p))])
+            return p
+
         if proj.shape[1] == 1:
             proj = np.column_stack([proj[:, 0], np.zeros(len(proj))])
-        return proj
+        return proj, _transform
 
     run_method("LDA (Q-based labels)", lda_q, fi, out)
 
@@ -117,7 +136,14 @@ def run(args, feat=None) -> None:
 
         if proj.shape[1] < 2:
             proj = np.column_stack([proj, np.zeros(len(proj))])
-        return proj
+
+        def _transform(Xnew):
+            p = Xnew.astype(np.float64) @ W
+            if p.shape[1] < 2:
+                p = np.column_stack([p, np.zeros(len(p))])
+            return p
+
+        return proj, _transform
 
     run_method("HLDA", hlda, fi, out)
 

@@ -61,10 +61,19 @@ script is then imported and run in-process against the shared features.
 Writes:
 
 - per-method CV maps → `outputs/<subsection>/<method>.svg`
-  — a 2 × 5 figure: top row = per-bin **mean** of each physical colouring in
-  CV-space, bottom row = per-bin **σ normalized by the colouring's value
-  range**, colorbar clipped at 10 % (values above show as the top
-  "extend" arrow).
+  — a 2 × 6 figure: top row = per-bin **mean** of each physical colouring in
+  CV-space (viridis), bottom row = per-bin **σ normalized by the colouring's
+  value range** (magma, easily distinguished from mean plots), colorbar
+  clipped at 10 % (values above show as the top "extend" arrow). The last
+  column is the **committor** (when the committor CSV is available): the
+  mean panel uses a blue → white → red diverging map centred at 0.5, so
+  basins of attraction read off immediately.
+- per-method **FES contour** → `outputs/<subsection>/<method>_fes.svg`
+  — free-energy landscape F = −k_BT ln P on the CV1/CV2 plane. By default
+  P(x, y) is estimated with a **Gaussian KDE** (smooth, no empty-bin
+  artefacts); switch to a classical 2-D histogram with `--fes-method hist`.
+  Temperature defaults to 298 K (kT ≈ 0.593 kcal/mol); contour lines are
+  drawn every **0.25 kcal/mol**, colorbar clipped at **10 kcal/mol**.
 - per-method **Rg-vs-Q CV maps** → `outputs/<subsection>/<method>_rg_vs_q.svg`
   — a 2 × 2 figure on the (Q, Rg) plane: columns = CV1 / CV2, rows = mean /
   normalized σ (same 10 % colorbar cap). Shows how each CV varies across the
@@ -81,9 +90,10 @@ Writes:
 
 ### Per-frame colourings used for the scatter subplots
 
-Each method's main plot is **two rows** of five hexbin panels over the first
-two CVs — top row is the per-bin *mean*, bottom row the per-bin *relative σ*
-(σ divided by the colouring's range, clipped at 10 %). Colourings are:
+Each method's main plot is **two rows** of five-to-six hexbin panels over the
+first two CVs — top row is the per-bin *mean* (viridis), bottom row the
+per-bin *relative σ* (magma, σ divided by the colouring's range, clipped at
+10 %). Colourings are:
 
 1. **Q** – fraction of native Cα–Cα contacts retained (Best–Hummer style,
    cutoff 8 Å, sequence separation ≥ 4, dₜ < 1.2 · d_native).
@@ -93,6 +103,14 @@ two CVs — top row is the per-bin *mean*, bottom row the per-bin *relative σ*
    Trp6 sidechain (auto-detected: the first TRP in the first 10 residues).
 5. **Helicity of residues 2–8** – fraction in the α-helical Ramachandran
    basin (−100 ≤ φ ≤ −30, −80 ≤ ψ ≤ 0).
+6. **Committor** *(optional, 6th column)* – loaded from
+   `/home/rat/Nancy_D/GNN/TRP_gnn/trp_k10.0.csv` (column `committor`) and
+   aligned to the trajectory frames via `feat.frame_indices`. The mean
+   panel uses a diverging **blue → white → red** colormap centred at 0.5
+   (`cmap="bwr"`, `vmin=0`, `vmax=1`) so folded (1.0) vs. unfolded (0.0)
+   basins separate visually; the std panel keeps the standard
+   magma/σ-normalised treatment. If the CSV is missing or its length is
+   inconsistent with the trajectory, the column is silently skipped.
 
 ### Run a single subsection
 
@@ -118,6 +136,8 @@ python scripts/04_deep_learning_cvs.py      --top sys.pdb --traj traj.dcd --epoc
 | `--epochs`    | `50`                    | Training epochs (deep-learning scripts)        |
 | `--batch-size`| `32`                    | Batch size (deep-learning scripts)             |
 | `--output-dir`| `outputs`               | Root output directory                          |
+| `--read`      | *(off)*                 | Skip CV training; reload each method's cached `.npy` from `--output-dir` and rebuild the plots, metrics, and `summary.html` only. Featurisation still runs (needed for the colourings + metrics). Cached outputs that aren't found are logged and skipped. GNN residue-importance maps (script 05) rely on a live forward pass and are automatically skipped in this mode; Pearson-based interpretability still runs from the cached CVs. |
+| `--fes-method`| `kde`                   | Density estimator for the per-method FES contour plot. `kde` (default) uses a Gaussian KDE on a 120 × 120 grid (subsampled to 50 k frames for speed) — smooth P(x, y) with **no empty-bin artefacts**. `hist` falls back to a 2-D histogram. |
 
 ---
 
@@ -127,7 +147,8 @@ python scripts/04_deep_learning_cvs.py      --top sys.pdb --traj traj.dcd --epoc
 2. **Nonlinear features → linear projection** (`02`) – PCA-distances, tICA-dihedrals, KernelPCA-contacts, DiffusionMap+PCA
 3. **Nonlinear manifold** (`03`) – Diffusion maps, Laplacian eigenmaps, Isomap, LLE, UMAP
 4. **Deep-learning CVs** (`04`) – TAE, VAMPnet, Deep-tICA, Deep-LDA, VAE
-5. **GNN CVs** (`05`) – EGNN-AE, SchNet-PCA, GraphVAMPnet, Latent-tICA
+5. **GNN CVs** (`05`) – EGNN-AE, SchNet-PCA, GraphVAMPnet (PyG SchNet),
+   **GraphVAMPnet (paper SchNet)**, Latent-tICA
 
 > ⚠️  Deep-learning and GNN scripts default to **50 epochs** and are
 > *demonstration* runs, **not** converged production models.  Increase
@@ -144,7 +165,8 @@ left as generic sensible values.
 
 | Method                | Paper (Trp-cage)                                           | Aligned settings                                                                                   |
 |-----------------------|------------------------------------------------------------|----------------------------------------------------------------------------------------------------|
-| GraphVAMPNet          | Ghorbani, Hoffmann & Ferguson, *J. Chem. Phys.* **156**, 184103 (2022) — [doi:10.1063/5.0085000](https://doi.org/10.1063/5.0085000) | graph cutoff **7.5 Å**; SchNet `hidden_channels = num_filters = 32`; `num_gaussians = 16`; 3 interaction blocks; state sweep **n ∈ {2, 5}** |
+| GraphVAMPNet (PyG SchNet)    | Ghorbani, Hoffmann & Ferguson, *J. Chem. Phys.* **156**, 184103 (2022) — [doi:10.1063/5.0085607](https://doi.org/10.1063/5.0085607) | graph cutoff **7.5 Å**; SchNet `hidden_channels = num_filters = 32`; `num_gaussians = 16`; 3 interaction blocks; state sweep **n ∈ {2, 5}** |
+| GraphVAMPNet (paper SchNet)  | Ghorbani, Hoffmann & Ferguson, *J. Chem. Phys.* **156**, 184103 (2022) — [doi:10.1063/5.0085607](https://doi.org/10.1063/5.0085607) | Faithful reproduction of the paper's **modified SchNet** (Table I): K-NN graph with `num_neighbors = 7` Cα atoms, `n_conv = 4` interaction blocks, `h_a = 16`, 12 Gaussians in [2 Å, 8 Å], `n_classes = 5`, `lr = 5e-4`, residual connections. Modification vs. vanilla SchNet: the continuous-filter convolution aggregates neighbors via a **learned attention softmax** (`softmax(conv · w_nbr)`) instead of a plain sum. Implementation: `cv_playground/schnet_graphvamp.py` |
 | VAMPnet               | Mardt, Pasquali, Wu & Noé, *Nature Communications* **9**, 5 (2018) — [doi:10.1038/s41467-017-02388-1](https://doi.org/10.1038/s41467-017-02388-1) | MLP lobe = **5 × 100-unit ELU layers** → n-state softmax; state sweep **n ∈ {2, 6}**                |
 | Diffusion maps        | Zheng, Rohrdanz & Clementi, *J. Phys. Chem. B* **117**, 12769 (2013) — [doi:10.1021/jp401911h](https://doi.org/10.1021/jp401911h) | `k = 100` nearest neighbours, α = ½, ε via `bgh` auto + 0.5·/1·/2·median² sweep                    |
 | tICA / Deep-TICA lag  | Bonati, Piccini & Parrinello, *PNAS* **118**, e2113533118 (2021) — [doi:10.1073/pnas.2113533118](https://doi.org/10.1073/pnas.2113533118); Schwantes & Pande, *JCTC* **9**, 2000 (2013) — [doi:10.1021/ct300878a](https://doi.org/10.1021/ct300878a) | default `--lag = 100` frames (= **20 ns** at `--dt-ps 200`)                                         |
@@ -162,6 +184,61 @@ TAE — Wehmeyer & Noé 2018 ([doi:10.1063/1.5011399](https://doi.org/10.1063/1.
 ([doi:10.1038/s41467-019-11405-4](https://doi.org/10.1038/s41467-019-11405-4)); VAE/VDE — Hernández et al. 2018
 ([doi:10.1103/PhysRevE.97.062412](https://doi.org/10.1103/PhysRevE.97.062412)); EGNN — Satorras, Hoogeboom & Welling 2021; SchNet — Schütt et al. 2018
 ([doi:10.1063/1.5019779](https://doi.org/10.1063/1.5019779)).
+
+---
+
+## Recent updates
+
+### Free-energy landscape (FES) contours
+Every method now gets a dedicated `{tag}_fes.svg` next to its hexbin figure.
+
+- F = −k_BT ln P on the CV1 / CV2 plane, minimum shifted to 0, colorbar
+  clipped at **10 kcal/mol**, kT ≈ 0.593 kcal/mol (298 K).
+- **Gaussian KDE by default** (120 × 120 grid, subsampled to 50 k frames for
+  speed, Scott bandwidth). The smooth density means there are **no empty-bin
+  artefacts** — basin boundaries are continuous. Opt into a histogram with
+  `--fes-method hist`.
+- Contour lines at **0.25 kcal/mol** spacing, drawn thicker
+  (`linewidths=0.8, alpha=0.7`) so they read clearly on top of the filled
+  contour.
+
+### Committor panels
+When `/home/rat/Nancy_D/GNN/TRP_gnn/trp_k10.0.csv` is present, the
+`committor` column is aligned to the trajectory's `frame_indices` and
+injected into `feat.colorings["Committor"]` by `attach_committor(feat)` —
+called by **every** script (01 – 05), not just the GNN one. That adds a
+6th column to every method's main hexbin figure:
+
+- **mean row** uses a diverging **blue → white → red** colormap
+  (`cmap="bwr"`, `vmin=0`, `vmax=1`), i.e. blue at committor 0 (unfolded),
+  white at 0.5 (transition), red at 1 (folded).
+- **std row** uses `magma`, the same treatment as every other coloring.
+
+Missing CSV or a frame-index mismatch is logged and silently skipped.
+
+### `--read` replay mode
+`--read` (added to `base_argparser`, so every script and `run_all.py`
+accept it) skips CV training and instead reloads each method's cached
+`{out_dir}/{tag}.npy`, then regenerates the hexbin plot, FES contour,
+Rg-vs-Q plot, metrics, Pearson-interpretability, and summary HTML. Methods
+whose cache is missing are logged and skipped. Featurisation still runs so
+the per-frame colourings and metric computations remain consistent.
+
+### Reference links & settings audit in `summary.html`
+- `_expl` in `cv_playground/utils.py` now accepts a list of
+  `(short-label, url)` tuples and renders one clickable link per cited
+  paper, so multi-paper entries (PCA Cartesians, PCA internal, tICA, HLDA,
+  Diffusion maps, LLE, UMAP, RAVE, EGNN, Latent-tICA) no longer hide
+  secondary references behind prose.
+- Fixed the broken GraphVAMPNet DOI `10.1063/5.0085000` (404) →
+  `10.1063/5.0085607` everywhere it appears (this README, method blocks,
+  secondary citations).
+- Added a dedicated hyperparameter card and method block for
+  **GraphVAMPnet (paper SchNet)** so its Table-I configuration shows up
+  in the HTML alongside the lighter-weight PyG variant.
+- `HLDA / Fisher LDA on distances` hyperparameter line updated to reflect
+  that labels are now Q-based first with k-means(RMSD) fallback (the
+  actual behaviour of `get_or_make_labels`).
 
 ---
 

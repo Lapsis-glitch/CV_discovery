@@ -149,6 +149,255 @@ def jacobian_contact_map(
     _contact_panels(loadings, n_atoms, save_path, title, mode="magnitude")
 
 
+def _pair_to_residue(pair_imp: np.ndarray, n_atoms: int) -> np.ndarray:
+    """Reduce a (n_pairs, n_cvs) pair-level importance to (n_atoms, n_cvs)
+    by averaging |importance| over all pairs touching each residue."""
+    pair_imp = np.abs(np.asarray(pair_imp, dtype=np.float64))
+    if pair_imp.ndim == 1:
+        pair_imp = pair_imp[:, None]
+    n_pairs, n_cvs = pair_imp.shape
+    iu, ku = np.triu_indices(n_atoms, k=1)
+    if len(iu) != n_pairs:
+        logger.warning("_pair_to_residue: %d pairs vs n_atoms=%d (expected %d).",
+                       n_pairs, n_atoms, len(iu))
+        m = min(len(iu), n_pairs)
+        iu, ku = iu[:m], ku[:m]
+        pair_imp = pair_imp[:m]
+    res = np.zeros((n_atoms, n_cvs))
+    counts = np.zeros(n_atoms)
+    np.add.at(res, iu, pair_imp)
+    np.add.at(res, ku, pair_imp)
+    np.add.at(counts, iu, 1.0)
+    np.add.at(counts, ku, 1.0)
+    res /= np.where(counts > 0, counts, 1.0)[:, None]
+    return res
+
+
+def eta2_pair(cvs: np.ndarray, X: np.ndarray, n_bins: int = 15) -> np.ndarray:
+    """Pair-level η² (correlation ratio) of each CV w.r.t. each feature.
+
+    For feature column j, bin frames by quantile of x_j, then
+    η²_jk = Var_bin( E[CV_k | bin] ) / Var(CV_k)  ∈ [0, 1].
+
+    Equivalent to the variance of a model-free PDP curve. Captures any
+    monotonic or non-monotonic dependence — strictly stronger than Pearson²
+    for nonlinear / non-monotonic CV maps.
+    """
+    cvs = np.asarray(cvs, dtype=np.float64)
+    X = np.asarray(X, dtype=np.float64)
+    n_frames, n_pairs = X.shape
+    n_cvs = cvs.shape[1]
+    cv_var = cvs.var(axis=0)
+    cv_var = np.where(cv_var > 1e-12, cv_var, 1.0)
+
+    q_edges = np.linspace(0.0, 1.0, n_bins + 1)
+    out = np.zeros((n_pairs, n_cvs))
+    for j in range(n_pairs):
+        x = X[:, j]
+        edges = np.unique(np.quantile(x, q_edges))
+        if len(edges) < 3:
+            continue
+        bins = np.clip(np.searchsorted(edges, x, side="right") - 1,
+                       0, len(edges) - 2)
+        n_b = len(edges) - 1
+        counts = np.bincount(bins, minlength=n_b).astype(np.float64)
+        total = counts.sum()
+        if total <= 0:
+            continue
+        p = counts / total
+        for k in range(n_cvs):
+            sums = np.bincount(bins, weights=cvs[:, k], minlength=n_b)
+            means = np.divide(sums, counts, out=np.zeros_like(sums),
+                              where=counts > 0)
+            mu = (p * means).sum()
+            out[j, k] = (p * (means - mu) ** 2).sum() / cv_var[k]
+    return out
+
+
+def pearson_pair(cvs: np.ndarray, X: np.ndarray) -> np.ndarray:
+    """Signed Pearson correlation of every CV column with every feature column.
+    Returns ``(n_pairs, n_cvs)``."""
+    cvs = np.asarray(cvs, dtype=np.float64)
+    X = np.asarray(X, dtype=np.float64)
+    Xm = X.mean(axis=0)
+    Xs = X.std(axis=0)
+    Xn = (X - Xm) / np.where(Xs > 1e-12, Xs, 1.0)
+    out = np.zeros((X.shape[1], cvs.shape[1]))
+    for k in range(cvs.shape[1]):
+        c = cvs[:, k]
+        cs = c.std()
+        if cs < 1e-12:
+            continue
+        cn = (c - c.mean()) / cs
+        out[:, k] = (Xn * cn[:, None]).mean(axis=0)
+    return out
+
+
+def condmean_range_pair(cvs: np.ndarray, X: np.ndarray,
+                        n_bins: int = 15) -> np.ndarray:
+    """``max_bin E[CV_k|bin] − min_bin E[CV_k|bin]`` per feature, per CV.
+    Returns ``(n_pairs, n_cvs)`` in raw CV units (un-normalised swing of
+    the conditional mean — the "PDP-from-data" curve range)."""
+    cvs = np.asarray(cvs, dtype=np.float64)
+    X = np.asarray(X, dtype=np.float64)
+    n_pairs = X.shape[1]
+    n_cvs = cvs.shape[1]
+    q_edges = np.linspace(0.0, 1.0, n_bins + 1)
+    out = np.zeros((n_pairs, n_cvs))
+    for j in range(n_pairs):
+        x = X[:, j]
+        edges = np.unique(np.quantile(x, q_edges))
+        if len(edges) < 3:
+            continue
+        bins = np.clip(np.searchsorted(edges, x, side="right") - 1,
+                       0, len(edges) - 2)
+        n_b = len(edges) - 1
+        counts = np.bincount(bins, minlength=n_b).astype(np.float64)
+        for k in range(n_cvs):
+            sums = np.bincount(bins, weights=cvs[:, k], minlength=n_b)
+            mask = counts > 0
+            if mask.sum() < 2:
+                continue
+            means = sums[mask] / counts[mask]
+            out[j, k] = means.max() - means.min()
+    return out
+
+
+def per_residue_eta2(cvs: np.ndarray, X: np.ndarray, n_atoms: int,
+                     n_bins: int = 15) -> tuple[np.ndarray, np.ndarray]:
+    """Universal model-free per-residue importance via η². Returns
+    ``(residue (n_atoms, n_cvs), pair (n_pairs, n_cvs))``."""
+    pair = eta2_pair(cvs, X, n_bins=n_bins)
+    return _pair_to_residue(pair, n_atoms), pair
+
+
+def per_residue_pdp(transform_fn, X: np.ndarray, n_atoms: int,
+                    top_pair_ids: np.ndarray | None = None,
+                    n_grid: int = 10, n_sub: int = 500,
+                    seed: int = 42) -> tuple[np.ndarray, np.ndarray] | None:
+    """Model-based PDP: perturb one pair-distance at a time, query the
+    model, measure normalised variance of the conditional CV mean.
+
+    Only ``top_pair_ids`` are queried (typically the top-30 η² pairs).
+    Unscored pairs contribute zero to the per-residue sum.
+    """
+    X = np.asarray(X, dtype=np.float64)
+    n_frames, n_pairs = X.shape
+    rng = np.random.default_rng(seed)
+    sub = rng.choice(n_frames, size=min(n_sub, n_frames), replace=False)
+    Xs = X[sub]
+    try:
+        z0 = np.asarray(transform_fn(Xs))
+    except Exception:
+        logger.exception("per_residue_pdp: probe forward pass failed.")
+        return None
+    if z0.ndim != 2:
+        logger.warning("per_residue_pdp: transform output ndim=%d ≠ 2.", z0.ndim)
+        return None
+    n_cvs = z0.shape[1]
+    cv_var = z0.var(axis=0)
+    cv_var = np.where(cv_var > 1e-12, cv_var, 1.0)
+
+    if top_pair_ids is None:
+        top_pair_ids = np.arange(n_pairs)
+    q = np.linspace(0.05, 0.95, n_grid)
+
+    pair_pdp = np.zeros((n_pairs, n_cvs))
+    for j in top_pair_ids:
+        grid = np.quantile(X[:, int(j)], q)
+        # batched: (n_grid * n_sub) rows, repeating Xs n_grid times
+        batch = np.tile(Xs, (n_grid, 1))
+        batch[:, int(j)] = np.repeat(grid, len(sub))
+        try:
+            z = np.asarray(transform_fn(batch))
+        except Exception:
+            logger.exception("per_residue_pdp: batch forward failed (pair %d).", j)
+            continue
+        z = z.reshape(n_grid, len(sub), n_cvs).mean(axis=1)
+        for k in range(n_cvs):
+            pair_pdp[int(j), k] = z[:, k].var() / cv_var[k]
+    return _pair_to_residue(pair_pdp, n_atoms), pair_pdp
+
+
+def per_residue_pdp_cartesian(transform_fn_3d, coords_3d: np.ndarray,
+                              n_grid: int = 10, n_sub: int = 500,
+                              seed: int = 42) -> np.ndarray | None:
+    """Axis-sweep PDP for models whose native input is Cartesian coordinates.
+
+    For each residue i and axis a ∈ {x, y, z}, sweep coords[:, i, a] over its
+    empirical 5–95 % quantile grid on a subsample of frames; measure the
+    normalised variance of the conditional CV mean; average over the three
+    axes. Returns ``(n_atoms, n_cvs)``.
+    """
+    coords_3d = np.asarray(coords_3d, dtype=np.float32)
+    n_frames, n_atoms, _ = coords_3d.shape
+    rng = np.random.default_rng(seed)
+    sub = rng.choice(n_frames, size=min(n_sub, n_frames), replace=False)
+    Xs = coords_3d[sub].copy()
+    try:
+        z0 = np.asarray(transform_fn_3d(Xs))
+    except Exception:
+        logger.exception("per_residue_pdp_cartesian: probe forward failed.")
+        return None
+    if z0.ndim != 2:
+        logger.warning("per_residue_pdp_cartesian: probe output ndim=%d.", z0.ndim)
+        return None
+    n_cvs = z0.shape[1]
+    cv_var = z0.var(axis=0)
+    cv_var = np.where(cv_var > 1e-12, cv_var, 1.0)
+
+    q = np.linspace(0.05, 0.95, n_grid).astype(np.float32)
+    out = np.zeros((n_atoms, n_cvs), dtype=np.float64)
+    for i in range(n_atoms):
+        for a in range(3):
+            grid = np.quantile(coords_3d[:, i, a], q).astype(np.float32)
+            batch = np.tile(Xs, (n_grid, 1, 1))
+            batch[:, i, a] = np.repeat(grid, len(sub))
+            try:
+                z = np.asarray(transform_fn_3d(batch))
+            except Exception:
+                logger.exception(
+                    "per_residue_pdp_cartesian: forward failed (atom %d axis %d).",
+                    i, a,
+                )
+                continue
+            z = z.reshape(n_grid, len(sub), n_cvs).mean(axis=1)
+            for k in range(n_cvs):
+                out[i, k] += z[:, k].var() / cv_var[k]
+        out[i] /= 3.0
+    return out
+
+
+def plot_residue_importance(eta2_res: np.ndarray,
+                            pdp_res: np.ndarray | None,
+                            save_path: Path, title: str) -> None:
+    """Bar chart of per-residue importance, one panel per CV. If both
+    estimators are provided, η² and PDP are drawn side-by-side per residue."""
+    eta2_res = np.asarray(eta2_res)
+    n_atoms, n_cvs = eta2_res.shape
+    has_pdp = pdp_res is not None
+    fig, axes = plt.subplots(1, n_cvs, figsize=(4.5 * n_cvs, 3.2),
+                             squeeze=False, sharey=False)
+    axes = axes[0]
+    x = np.arange(1, n_atoms + 1)
+    for k, ax in enumerate(axes):
+        if has_pdp:
+            w = 0.4
+            ax.bar(x - w / 2, eta2_res[:, k], width=w, color="C0", label="η² (data)")
+            ax.bar(x + w / 2, pdp_res[:, k], width=w, color="C3", label="PDP (model)")
+            if k == 0:
+                ax.legend(loc="upper right", fontsize=8)
+        else:
+            ax.bar(x, eta2_res[:, k], color="C0")
+        ax.set_xlabel("residue (Cα index)")
+        if k == 0:
+            ax.set_ylabel("normalised importance")
+        ax.set_title(f"CV {k + 1}")
+        ax.set_xlim(0.5, n_atoms + 0.5)
+    fig.suptitle(title, fontsize=12, y=1.02)
+    _save(fig, save_path)
+
+
 def gnn_residue_importance(
     forward_fn, graphs, n_atoms: int,
     save_path: Path, title: str,

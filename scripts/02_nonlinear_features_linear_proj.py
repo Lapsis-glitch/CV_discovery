@@ -18,8 +18,9 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from cv_playground.io import featurize
+from cv_playground.io import featurize_cached
 from cv_playground.utils import (
+    attach_committor,
     base_argparser,
     log_effective_tau,
     run_method,
@@ -34,8 +35,9 @@ SUBSECTION = "02_nonlinear_features_linear_proj"
 def run(args, feat=None) -> None:
     set_seed(args.seed)
     if feat is None:
-        feat = featurize(args.top, args.traj, args.stride, args.selection, native=args.native)
+        feat = featurize_cached(args.top, args.traj, args.stride, args.selection, native=args.native, cache_dir=getattr(args, "cache_dir", "outputs/cache"), read_cache=getattr(args, "read", False))
     out = Path(args.output_dir) / SUBSECTION
+    attach_committor(feat)
     fi = feat.colorings
     log_effective_tau(args, "script 02 tICA-dihedrals")
     set_run_context(feat=feat, args=args, interpret_mode="pearson")
@@ -43,7 +45,8 @@ def run(args, feat=None) -> None:
     # ── 1. PCA on pairwise distances ────────────────────────────────────────
     def pca_distances():
         from sklearn.decomposition import PCA
-        return PCA(n_components=2, random_state=args.seed).fit_transform(feat.distances)
+        m = PCA(n_components=2, random_state=args.seed).fit(feat.distances)
+        return m.transform(feat.distances), lambda X: m.transform(X)
 
     run_method("PCA Distances", pca_distances, fi, out)
 
@@ -56,6 +59,9 @@ def run(args, feat=None) -> None:
     run_method("tICA Dihedrals", tica_dihedrals, fi, out)
 
     # ── 3. Kernel PCA (RBF) on contact maps — median-heuristic γ ───────────
+    # PDP transform_fn re-thresholds perturbed pair distances at the 8 Å
+    # cutoff used in featurize() before calling kpca.transform → distance
+    # PDP composes through the contact encoder.
     def kpca_contacts():
         from sklearn.decomposition import KernelPCA
         from scipy.spatial.distance import pdist
@@ -67,7 +73,13 @@ def run(args, feat=None) -> None:
         gamma = 1.0 / (2.0 * med_sq)
         kpca = KernelPCA(n_components=2, kernel="rbf", gamma=gamma,
                          random_state=args.seed)
-        return kpca.fit_transform(feat.contacts)
+        cvs = kpca.fit_transform(feat.contacts)
+
+        def _tf(X_dist, _k=kpca):
+            c = (np.asarray(X_dist) < 8.0).astype(np.float32)
+            return _k.transform(c)
+
+        return cvs, _tf
 
     run_method("KernelPCA Contacts (median-γ)", kpca_contacts, fi, out)
 

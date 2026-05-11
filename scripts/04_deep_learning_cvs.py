@@ -23,9 +23,10 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from cv_playground.io import featurize
+from cv_playground.io import featurize_cached
 from cv_playground.utils import (
     EarlyStopping,
+    attach_committor,
     base_argparser,
     get_device,
     get_or_make_labels,
@@ -58,8 +59,9 @@ def run(args, feat=None) -> None:
     set_seed(args.seed)
     device = get_device()
     if feat is None:
-        feat = featurize(args.top, args.traj, args.stride, args.selection, native=args.native)
+        feat = featurize_cached(args.top, args.traj, args.stride, args.selection, native=args.native, cache_dir=getattr(args, "cache_dir", "outputs/cache"), read_cache=getattr(args, "read", False))
     out = Path(args.output_dir) / SUBSECTION
+    attach_committor(feat)
     fi = feat.colorings
     X_dist = feat.distances.astype(np.float32)
     n_feat = X_dist.shape[1]
@@ -70,6 +72,32 @@ def run(args, feat=None) -> None:
 
     from cv_playground import interpret
     encoders: dict = {}   # populated by each closure: name -> (encoder_fn, device)
+
+    def _torch_pdp_fn(enc, dev):
+        """Wrap a torch encoder into a numpy transform_fn for per_residue_pdp.
+
+        - Disables grad.
+        - Slices output to the first two CVs (matches what run_method keeps).
+        - Handles encoders that return (recon, z) or similar tuples.
+        """
+        import torch as _torch
+
+        def _fn(X_np):
+            was_training = enc.training
+            enc.eval()
+            try:
+                xt = _torch.as_tensor(X_np, dtype=_torch.float32, device=dev)
+                with _torch.no_grad():
+                    z = enc(xt)
+                if isinstance(z, (tuple, list)):
+                    z = z[-1] if z[-1].ndim == 2 else z[0]
+                z = z.detach().cpu().numpy()
+            finally:
+                if was_training:
+                    enc.train()
+            return z[:, :2] if z.ndim == 2 and z.shape[1] > 2 else z
+
+        return _fn
 
     def _interpret(name: str) -> None:
         if name not in encoders:
@@ -140,7 +168,7 @@ def run(args, feat=None) -> None:
         with torch.no_grad():
             _, z = model(_to_tensor(X_dist).to(device))
         encoders["TAE"] = (lambda x, _m=model: _m.encoder(x), device)
-        return z.cpu().numpy()
+        return z.cpu().numpy(), _torch_pdp_fn(model.encoder, device)
 
     run_method("TAE", tae, fi, out)
     _interpret("TAE")
@@ -195,7 +223,8 @@ def run(args, feat=None) -> None:
             if isinstance(cvs, torch.Tensor):
                 cvs = cvs.detach().cpu().numpy()
             encoders[reg_name] = (lambda x, _l=lobe: _l(x), device)
-            return cvs[:, :2] if cvs.shape[1] > 2 else cvs
+            cvs = cvs[:, :2] if cvs.shape[1] > 2 else cvs
+            return cvs, _torch_pdp_fn(lobe, device)
         return _fn
 
     # n ∈ {2, 6}: Mardt et al. 2018 reports a 6-state VAMPnet for Trp-cage
@@ -241,7 +270,7 @@ def run(args, feat=None) -> None:
         with torch.no_grad():
             cvs = model(_to_tensor(X_dist).to(model.device))
         encoders["Deep-tICA"] = (lambda x, _m=model: _m(x), model.device)
-        return cvs.cpu().numpy()
+        return cvs.cpu().numpy(), _torch_pdp_fn(model, model.device)
 
     run_method("Deep-tICA", deep_tica, fi, out)
     _interpret("Deep-tICA")
@@ -294,7 +323,18 @@ def run(args, feat=None) -> None:
         cvs = cvs.cpu().numpy()
         if cvs.shape[1] < 2:
             cvs = np.column_stack([cvs, np.zeros(len(cvs))])
-        return cvs
+
+        def _tf(X_np, _m=model):
+            import torch as _t
+            _m.eval()
+            with _t.no_grad():
+                z = _m(_t.as_tensor(X_np, dtype=_t.float32, device=_m.device))
+            z = z.detach().cpu().numpy()
+            if z.ndim == 2 and z.shape[1] < 2:
+                z = np.column_stack([z, np.zeros(len(z))])
+            return z[:, :2]
+
+        return cvs, _tf
 
     run_method("Deep-LDA", deep_lda, fi, out)
     _interpret("Deep-LDA")
@@ -356,7 +396,16 @@ def run(args, feat=None) -> None:
         with torch.no_grad():
             mu, _ = model.encode(_to_tensor(X_dist).to(device))
         encoders["VAE"] = (lambda x, _m=model: _m.encode(x)[0], device)
-        return mu.cpu().numpy()
+
+        def _tf(X_np, _m=model, _dev=device):
+            import torch as _t
+            _m.eval()
+            with _t.no_grad():
+                m, _ = _m.encode(_t.as_tensor(X_np, dtype=_t.float32, device=_dev))
+            m = m.detach().cpu().numpy()
+            return m[:, :2] if m.shape[1] > 2 else m
+
+        return mu.cpu().numpy(), _tf
 
     run_method("VAE", vae, fi, out)
     _interpret("VAE")
@@ -417,7 +466,16 @@ def run(args, feat=None) -> None:
         with torch.no_grad():
             mu, _ = model.encode(_to_tensor(X_dist).to(device))
         encoders["RAVE (time-lagged VAE)"] = (lambda x, _m=model: _m.encode(x)[0], device)
-        return mu.cpu().numpy()
+
+        def _tf(X_np, _m=model, _dev=device):
+            import torch as _t
+            _m.eval()
+            with _t.no_grad():
+                m, _ = _m.encode(_t.as_tensor(X_np, dtype=_t.float32, device=_dev))
+            m = m.detach().cpu().numpy()
+            return m[:, :2] if m.shape[1] > 2 else m
+
+        return mu.cpu().numpy(), _tf
 
     run_method("RAVE (time-lagged VAE)", rave, fi, out)
     _interpret("RAVE (time-lagged VAE)")

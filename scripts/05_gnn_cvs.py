@@ -15,9 +15,10 @@ import sys
 from pathlib import Path
 import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from cv_playground.io import featurize
+from cv_playground.io import featurize_cached
 from cv_playground.utils import (
     EarlyStopping,
+    attach_committor,
     base_argparser,
     get_device,
     log_effective_tau,
@@ -146,8 +147,9 @@ def run(args, feat=None) -> None:
     set_seed(args.seed)
     device = get_device()
     if feat is None:
-        feat = featurize(args.top, args.traj, args.stride, args.selection, native=args.native)
+        feat = featurize_cached(args.top, args.traj, args.stride, args.selection, native=args.native, cache_dir=getattr(args, "cache_dir", "outputs/cache"), read_cache=getattr(args, "read", False))
     out = Path(args.output_dir) / SUBSECTION
+    attach_committor(feat)
     fi = feat.colorings
     n_atoms = feat.n_atoms
     log_effective_tau(args, "script 05 time-lagged GNN")
@@ -157,6 +159,20 @@ def run(args, feat=None) -> None:
 
     from cv_playground import interpret
     gnn_forwards: dict = {}
+
+    def _coords_to_pyg_batch(coords_np, cutoff, dev):
+        """(B, n_atoms, 3) numpy → batched PyG graph on device."""
+        import torch
+        from torch_geometric.data import Data, Batch
+        from torch_geometric.nn import radius_graph
+        chunks = []
+        h = torch.ones(n_atoms, 1, dtype=torch.float32)
+        z = torch.zeros(n_atoms, dtype=torch.long)
+        for frame in coords_np:
+            pos = torch.as_tensor(frame, dtype=torch.float32)
+            ei = radius_graph(pos, r=cutoff, loop=False)
+            chunks.append(Data(x=h.clone(), z=z.clone(), pos=pos, edge_index=ei))
+        return Batch.from_data_list(chunks).to(dev)
     # cutoff 7.5 Å follows Ghorbani, Hoffmann & Ferguson 2022 (GraphVAMPNet)
     # for the Trp-cage benchmark. Cα graph, no self-loops.
     logger.info("Building molecular graphs (cutoff = 7.5 A, per GraphVAMPNet/Trp-cage) ...")
@@ -196,7 +212,17 @@ def run(args, feat=None) -> None:
                 _, z = model(batch)
                 zs.append(z.cpu().numpy())
         gnn_forwards["EGNN Autoencoder"] = (lambda b, _m=model: _m(b)[1], device)
-        return np.concatenate(zs, axis=0)
+
+        def _tf(coords_np, _m=model, _dev=device):
+            import torch as _t
+            _m.eval()
+            batch = _coords_to_pyg_batch(coords_np, cutoff=10.0, dev=_dev)
+            with _t.no_grad():
+                _, z = _m(batch)
+            z = z.detach().cpu().numpy()
+            return z[:, :2] if z.shape[1] > 2 else z
+
+        return np.concatenate(zs, axis=0), _tf, "cartesian"
     egnn_cvs = run_method("EGNN Autoencoder", egnn_ae, fi, out)
     if egnn_cvs is not None and "EGNN Autoencoder" in gnn_forwards:
         fwd, dev = gnn_forwards["EGNN Autoencoder"]
@@ -251,7 +277,18 @@ def run(args, feat=None) -> None:
                 batch = batch.to(device)
                 embs.append(model(batch.z, batch.pos, batch.batch).cpu().numpy())
         embs = np.concatenate(embs, axis=0)
-        return PCA(n_components=2, random_state=args.seed).fit_transform(embs)
+        pca = PCA(n_components=2, random_state=args.seed).fit(embs)
+        cvs = pca.transform(embs)
+
+        def _tf(coords_np, _m=model, _pca=pca, _dev=device):
+            import torch as _t
+            _m.eval()
+            batch = _coords_to_pyg_batch(coords_np, cutoff=10.0, dev=_dev)
+            with _t.no_grad():
+                e = _m(batch.z, batch.pos, batch.batch).cpu().numpy()
+            return _pca.transform(e)
+
+        return cvs, _tf, "cartesian"
     schnet_cvs = run_method("SchNet + PCA", schnet_pca, fi, out)
     if schnet_cvs is not None:
         interpret.pearson_loading_map(
@@ -311,7 +348,17 @@ def run(args, feat=None) -> None:
                     zs.append(lobe(batch.to(device)).cpu().numpy())
             gnn_forwards[reg_name] = (lambda b, _l=lobe: _l(b), device)
             cvs = np.concatenate(zs, axis=0)
-            return cvs[:, :2] if cvs.shape[1] > 2 else cvs
+            cvs = cvs[:, :2] if cvs.shape[1] > 2 else cvs
+
+            def _tf(coords_np, _l=lobe, _dev=device):
+                import torch as _t
+                _l.eval()
+                batch = _coords_to_pyg_batch(coords_np, cutoff=7.5, dev=_dev)
+                with _t.no_grad():
+                    z = _l(batch).cpu().numpy()
+                return z[:, :2] if z.shape[1] > 2 else z
+
+            return cvs, _tf, "cartesian"
         return _fn
 
     # n ∈ {2, 5}: 5-state assignment is the headline Trp-cage result in
@@ -328,6 +375,62 @@ def run(args, feat=None) -> None:
                 title=f"{_gv_name} — mean |∂CV/∂pos| per residue",
                 device=dev,
             )
+    # ── 3b. GraphVAMPNet w/ paper-faithful modified SchNet (Trp-cage) ──────
+    def graph_vampnet_paper_schnet():
+        import torch
+        from cv_playground.schnet_graphvamp import (
+            GraphVampNetSchNet, build_knn_tensor,
+        )
+        # Paper (Ghorbani/Hoffmann/Ferguson 2022) Table I defaults:
+        #   n_conv=4, h_a=16, num_neighbors=7, 12 Gaussians in [2,8] Å,
+        #   n_classes=5, batch=1000, lr=5e-4.
+        num_neighbors = min(7, n_atoms - 1)
+        knn = build_knn_tensor(feat.coords_3d, num_neighbors).to(device)
+        model = GraphVampNetSchNet(
+            num_atoms=n_atoms, num_neighbors=num_neighbors, n_classes=5,
+            n_conv=4, h_a=16, dmin=2.0, dmax=8.0, step=0.5, residual=True,
+        ).to(device)
+        opt = torch.optim.Adam(model.parameters(), lr=5e-4)
+        bs = min(1000, max(16, args.batch_size))
+        n_frames = knn.shape[0]
+        lag = args.lag
+        idx_all = np.arange(n_frames - lag)
+        model.train()
+        stopper = EarlyStopping(args.patience, args.min_delta,
+                                name="GraphVAMPnet (paper SchNet)")
+        for epoch in range(args.epochs):
+            np.random.shuffle(idx_all)
+            total = 0.0; nb = 0
+            for i in range(0, len(idx_all), bs):
+                sel = idx_all[i:i + bs]
+                if len(sel) < 2:
+                    continue
+                bt = knn[sel]
+                btau = knn[sel + lag]
+                loss = _vamp2_loss(model(bt), model(btau))
+                opt.zero_grad(); loss.backward(); opt.step()
+                total += loss.item(); nb += 1
+            if nb and stopper.step(total / nb, epoch):
+                break
+        model.eval()
+        probs = []
+        with torch.no_grad():
+            for i in range(0, n_frames, bs):
+                probs.append(model(knn[i:i + bs]).cpu().numpy())
+        probs = np.concatenate(probs, axis=0)
+
+        def _tf(coords_np, _m=model, _dev=device, _nn=num_neighbors):
+            import torch as _t
+            _m.eval()
+            knn_pert = build_knn_tensor(np.asarray(coords_np, dtype=np.float32),
+                                        _nn).to(_dev)
+            with _t.no_grad():
+                p = _m(knn_pert).cpu().numpy()
+            return p[:, :2]
+
+        return probs[:, :2], _tf, "cartesian"
+    run_method("GraphVAMPnet (paper SchNet)", graph_vampnet_paper_schnet, fi, out)
+
     # ── 4. Latent-space tICA on EGNN embeddings ────────────────────────────
     def latent_tica():
         if egnn_cvs is None:

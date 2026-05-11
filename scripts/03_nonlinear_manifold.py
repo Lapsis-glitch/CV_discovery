@@ -19,8 +19,9 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from cv_playground.io import featurize
+from cv_playground.io import featurize_cached
 from cv_playground.utils import (
+    attach_committor,
     base_argparser,
     run_method,
     set_run_context,
@@ -34,8 +35,9 @@ SUBSECTION = "03_nonlinear_manifold"
 def run(args, feat=None) -> None:
     set_seed(args.seed)
     if feat is None:
-        feat = featurize(args.top, args.traj, args.stride, args.selection, native=args.native)
+        feat = featurize_cached(args.top, args.traj, args.stride, args.selection, native=args.native, cache_dir=getattr(args, "cache_dir", "outputs/cache"), read_cache=getattr(args, "read", False))
     out = Path(args.output_dir) / SUBSECTION
+    attach_committor(feat)
     fi = feat.colorings
     X = feat.distances          # default high-dim input for all methods here
     set_run_context(feat=feat, args=args, interpret_mode="pearson")
@@ -76,15 +78,17 @@ def run(args, feat=None) -> None:
     def _make_isomap(k):
         def _fn():
             from sklearn.manifold import Isomap
-            return Isomap(n_components=2, n_neighbors=k).fit_transform(X)
+            m = Isomap(n_components=2, n_neighbors=k).fit(X)
+            return m.transform(X), lambda Xn: m.transform(Xn)
         return _fn
 
     def _make_lle(k):
         def _fn():
             from sklearn.manifold import LocallyLinearEmbedding
-            return LocallyLinearEmbedding(
+            m = LocallyLinearEmbedding(
                 n_components=2, n_neighbors=k, random_state=args.seed,
-            ).fit_transform(X)
+            ).fit(X)
+            return m.transform(X), lambda Xn: m.transform(Xn)
         return _fn
 
     for _k in (5, 15, 50):

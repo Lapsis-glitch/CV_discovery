@@ -64,6 +64,27 @@ def base_argparser(description: str = "") -> argparse.ArgumentParser:
                    help="Batch size  (default 32)")
     p.add_argument("--output-dir",default="outputs",     dest="output_dir",
                    help="Root output directory  (default outputs)")
+    p.add_argument("--cache-dir", default="outputs/cache", dest="cache_dir",
+                   help="Directory for the featurized-trajectory cache "
+                        "(.npz). When --read is on and a cache file exists, "
+                        "MDAnalysis is skipped entirely.  (default outputs/cache)")
+    p.add_argument("--read",      action="store_true",
+                   help="Skip CV training; reload each method's cached .npy "
+                        "from --output-dir and regenerate the plots, metrics, "
+                        "and summary.html only.  Also enables the featurized-"
+                        "trajectory cache load from --cache-dir (skips MDA).")
+    p.add_argument("--fes-method", choices=("kde", "hist"), default="kde",
+                   dest="fes_method",
+                   help="Density estimator for the free-energy-landscape "
+                        "contour plot. 'kde' (default) uses Gaussian KDE on a "
+                        "fine grid — smooth P(x, y) with no empty-bin "
+                        "artifacts. 'hist' falls back to a 2-D histogram.")
+    p.add_argument("--kde-bw", default="0.25", dest="kde_bw",
+                   help="Gaussian-KDE bandwidth for the FES contour plot. "
+                        "Pass a float (smaller = sharper basins, larger = "
+                        "smoother) or the string 'scott' / 'silverman' for "
+                        "scipy's automatic rules. Default 0.25 — narrower "
+                        "than scipy's 'scott' default so basins are crisper.")
     return p
 
 
@@ -233,6 +254,46 @@ def timer(method_name: str):
     logger.info("✔ %s – finished in %.2f s", method_name, elapsed)
 
 
+# ───────────────────────────── committor ───────────────────────────────────
+
+COMMITTOR_CSV = Path("/home/rat/Nancy_D/GNN/TRP_gnn/trp_k10.0.csv")
+
+
+def load_committor(frame_indices: np.ndarray,
+                   csv_path: Path | str = COMMITTOR_CSV) -> np.ndarray | None:
+    """Read the ``committor`` column from ``csv_path`` and align it to the
+    selected trajectory frames. Returns ``None`` if the file is missing or
+    indexing would fall out of range."""
+    csv_path = Path(csv_path)
+    if not csv_path.exists():
+        logger.warning("Committor CSV not found: %s", csv_path)
+        return None
+    committor = np.loadtxt(
+        csv_path, delimiter=",", skiprows=1, usecols=9, dtype=np.float64,
+    )
+    idx = np.asarray(frame_indices, dtype=np.int64)
+    if idx.size == 0 or idx.max() >= committor.size:
+        logger.warning(
+            "Committor length %d < max frame index %d — skipping.",
+            committor.size, int(idx.max()) if idx.size else -1,
+        )
+        return None
+    return committor[idx]
+
+
+def attach_committor(feat, csv_path: Path | str = COMMITTOR_CSV) -> None:
+    """Inject committor into ``feat.colorings`` as key ``"Committor"`` when
+    available — a no-op otherwise."""
+    committor = load_committor(feat.frame_indices, csv_path)
+    if committor is None:
+        return
+    feat.colorings["Committor"] = committor
+    logger.info(
+        "Committor loaded: n=%d  mean=%.3f  std=%.3f",
+        committor.size, float(np.nanmean(committor)), float(np.nanstd(committor)),
+    )
+
+
 # ───────────────────────────── plotting ─────────────────────────────────────
 
 def scatter_cv(
@@ -271,6 +332,7 @@ def scatter_cv(
         # Scale factor used to normalize the std panel: relative-std = σ / range.
         vrange = float(np.nanmax(vals) - np.nanmin(vals))
         scale = vrange if vrange > 0 else 1.0
+        is_committor = label.lower().startswith("committor")
         for row, (reducer, stat_name) in enumerate(
             ((np.mean, "mean"), (np.std, "std")),
         ):
@@ -281,9 +343,15 @@ def scatter_cv(
                 cmap="viridis",
                 reduce_C_function=reducer,
             )
+            if is_committor and stat_name == "mean":
+                # Diverging blue→white→red around 0.5 for committor values in [0, 1].
+                hb_kwargs["cmap"] = "bwr"
+                hb_kwargs["vmin"] = 0.0
+                hb_kwargs["vmax"] = 1.0
             if stat_name == "std":
                 # Normalize σ by the coloring's range, then clip colorbar at 10 %.
                 hb_kwargs["reduce_C_function"] = lambda a, s=scale: np.std(a) / s
+                hb_kwargs["cmap"] = "magma"
                 hb_kwargs["vmin"] = 0.0
                 hb_kwargs["vmax"] = 0.1
             hb = ax.hexbin(x, y, C=vals, **hb_kwargs)
@@ -303,6 +371,360 @@ def scatter_cv(
     fig.savefig(str(svg_path), bbox_inches="tight")
     plt.close(fig)
     logger.info("Saved plot → %s", svg_path)
+
+
+def fes_contour(
+    cvs: np.ndarray,
+    save_path: str | Path,
+    bins: int = 60,
+    kT: float = 0.593,
+    title: str = "Free energy landscape",
+    max_F: float | None = 10.0,
+    method: str = "kde",
+    kde_grid: int = 120,
+    kde_bw: str | float = "scott",
+    kde_subsample: int = 50_000,
+    rep_points: dict | None = None,
+) -> None:
+    """Plot the free energy landscape F(CV1, CV2) = -kT ln P(CV1, CV2) as a
+    filled contour. The minimum is shifted to 0 and the colorbar is clipped
+    above ``max_F`` kcal/mol (default 10).
+
+    ``method``:
+      * ``"kde"`` (default) — Gaussian KDE on a ``kde_grid``×``kde_grid`` mesh;
+        smooth P(x, y) with no empty-bin artifacts. ``kde_subsample`` caps the
+        number of samples passed to ``scipy.stats.gaussian_kde`` for speed.
+      * ``"hist"`` — classical 2-D histogram with ``bins`` per axis.
+    """
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    svg_path = save_path.with_suffix(".svg")
+
+    x, y = cvs[:, 0], cvs[:, 1]
+    finite_xy = np.isfinite(x) & np.isfinite(y)
+    x, y = x[finite_xy], y[finite_xy]
+
+    if method == "kde":
+        from scipy.stats import gaussian_kde
+        if kde_subsample and x.size > kde_subsample:
+            rng = np.random.default_rng(0)
+            sel = rng.choice(x.size, size=kde_subsample, replace=False)
+            xs, ys = x[sel], y[sel]
+        else:
+            xs, ys = x, y
+        bw: str | float = kde_bw
+        if isinstance(bw, str):
+            try:
+                bw = float(bw)
+            except ValueError:
+                pass          # keep as 'scott' / 'silverman' / etc.
+        kde = gaussian_kde(np.vstack([xs, ys]), bw_method=bw)
+        xg = np.linspace(x.min(), x.max(), kde_grid)
+        yg = np.linspace(y.min(), y.max(), kde_grid)
+        X, Y = np.meshgrid(xg, yg, indexing="ij")
+        P = kde(np.vstack([X.ravel(), Y.ravel()])).reshape(X.shape)
+        P = P / P.sum()
+        with np.errstate(divide="ignore"):
+            F = -kT * np.log(P)
+    elif method == "hist":
+        H, xe, ye = np.histogram2d(x, y, bins=bins)
+        P = H / H.sum() if H.sum() > 0 else H
+        with np.errstate(divide="ignore"):
+            F = -kT * np.log(P)
+        xc = 0.5 * (xe[:-1] + xe[1:])
+        yc = 0.5 * (ye[:-1] + ye[1:])
+        X, Y = np.meshgrid(xc, yc, indexing="ij")
+    else:
+        raise ValueError(f"fes_contour: unknown method {method!r} (expected 'kde' or 'hist').")
+
+    finite = np.isfinite(F)
+    if finite.any():
+        F -= F[finite].min()
+    F = np.where(finite, F, np.nan)
+    if max_F is not None:
+        F = np.where(F > max_F, np.nan, F)
+    F = np.ma.masked_invalid(F)
+
+    fig, ax = plt.subplots(figsize=(6.4, 5.0), constrained_layout=True)
+    top = float(max_F) if max_F is not None else float(np.nanmax(F))
+    step = 0.25
+    levels = np.arange(0.0, top + step, step)
+    cf = ax.contourf(X, Y, F, levels=levels, cmap="viridis", extend="max")
+    ax.contour(X, Y, F, levels=levels, colors="k", linewidths=0.8, alpha=0.7)
+    cbar = fig.colorbar(cf, ax=ax, shrink=0.9)
+    cbar.set_label("Free energy (kcal/mol)", fontsize=9)
+    cbar.ax.tick_params(labelsize=7)
+    ax.set_xlabel("CV 1")
+    ax.set_ylabel("CV 2")
+    ax.set_title(title, fontsize=11)
+    # Overlay basin representative-structure markers as diamonds.
+    if rep_points:
+        styles = {
+            "watershed": dict(facecolor="white", edgecolor="black",
+                              label="watershed rep"),
+            "clustering": dict(facecolor="gold",  edgecolor="black",
+                               label="clustering rep"),
+        }
+        for key, pts in rep_points.items():
+            if pts is None or len(pts) == 0:
+                continue
+            pts = np.asarray(pts)
+            style = styles.get(key, dict(facecolor="red", edgecolor="black",
+                                         label=f"{key} rep"))
+            ax.scatter(pts[:, 0], pts[:, 1], marker="D", s=90,
+                       linewidths=1.2, zorder=10, **style)
+        if any(v is not None and len(v) for v in rep_points.values()):
+            ax.legend(loc="best", fontsize=8, framealpha=0.85)
+
+    # Keep the full data range visible so the FES isn't cropped.
+    ax.set_xlim(float(x.min()), float(x.max()))
+    ax.set_ylim(float(y.min()), float(y.max()))
+    ax.margins(0)
+    fig.savefig(str(svg_path), bbox_inches="tight", pad_inches=0.1)
+    plt.close(fig)
+    logger.info("Saved plot → %s", svg_path)
+
+
+# ───────────────────────────── publication panel ───────────────────────────
+
+# Paul Tol "iridescent" colormap (23 stops, ends near-white).
+# Source: Paul Tol's "Colour Schemes" technical note (SRON/TN/2018-003).
+_TOL_IRIDESCENT_HEX = [
+    "#FEFBE9", "#FCF7D5", "#F5F3C1", "#EAF0B5", "#DDECBF", "#D0E7CA",
+    "#C2E3D2", "#B5DDD8", "#A8D8DC", "#9BD2E1", "#8DCBE4", "#81C4E7",
+    "#7BBCE7", "#7EB2E4", "#88A5DD", "#9398D2", "#9B8AC4", "#9D7DB2",
+    "#9A709E", "#906388", "#805770", "#684957", "#46353A",
+]
+
+
+def _tol_iridescent_cmap():
+    from matplotlib.colors import LinearSegmentedColormap
+    # Reverse so highest values map to the near-white end (#FEFBE9).
+    return LinearSegmentedColormap.from_list(
+        "tol_iridescent", list(reversed(_TOL_IRIDESCENT_HEX)), N=256,
+    )
+
+
+_PUB_RC = {
+    "font.family":     "serif",
+    "font.serif":      ["CMU Serif", "Computer Modern Roman", "DejaVu Serif"],
+    "mathtext.fontset": "cm",
+    "axes.unicode_minus": False,
+    "font.size":       28,
+    "axes.labelsize":  32,
+    "axes.titlesize":  32,
+    "xtick.labelsize": 26,
+    "ytick.labelsize": 26,
+    "legend.fontsize": 24,
+}
+
+
+def _hexbin_coloring(ax, x, y, vals, cmap, *, vmin=None, vmax=None,
+                     gridsize=45, mincnt=1):
+    finite = np.isfinite(x) & np.isfinite(y) & np.isfinite(vals)
+    if not finite.any():
+        ax.text(0.5, 0.5, "n/a", ha="center", va="center",
+                transform=ax.transAxes, fontsize=14)
+        return None
+    return ax.hexbin(
+        x[finite], y[finite], C=vals[finite],
+        gridsize=gridsize, mincnt=mincnt, cmap=cmap,
+        reduce_C_function=np.mean, vmin=vmin, vmax=vmax,
+    )
+
+
+def _kde_F(x, y, kT=0.593, kde_grid=120, kde_bw="scott", kde_subsample=50_000):
+    from scipy.stats import gaussian_kde
+    finite = np.isfinite(x) & np.isfinite(y)
+    x, y = x[finite], y[finite]
+    if x.size < 5:
+        return None
+    if kde_subsample and x.size > kde_subsample:
+        rng = np.random.default_rng(0)
+        sel = rng.choice(x.size, size=kde_subsample, replace=False)
+        xs, ys = x[sel], y[sel]
+    else:
+        xs, ys = x, y
+    bw = kde_bw
+    if isinstance(bw, str):
+        try:
+            bw = float(bw)
+        except ValueError:
+            pass
+    kde = gaussian_kde(np.vstack([xs, ys]), bw_method=bw)
+    xg = np.linspace(x.min(), x.max(), kde_grid)
+    yg = np.linspace(y.min(), y.max(), kde_grid)
+    X, Y = np.meshgrid(xg, yg, indexing="ij")
+    P = kde(np.vstack([X.ravel(), Y.ravel()])).reshape(X.shape)
+    P = P / max(P.sum(), 1e-300)
+    with np.errstate(divide="ignore"):
+        F = -kT * np.log(P)
+    finite_F = np.isfinite(F)
+    if finite_F.any():
+        F = F - F[finite_F].min()
+    return X, Y, F
+
+
+def publication_panel(
+    cvs: np.ndarray,
+    colorings: dict,
+    save_path: str | Path,
+    kde_bw: str | float = "scott",
+    kT: float = 0.593,
+    max_F: float = 10.0,
+) -> None:
+    """One compound figure per analysis: top row of three hexbin maps
+    (RMSD, Q, helicity 2–8) sharing CV2 axis; bottom panel ~1.5× size,
+    left-aligned, hexbin of committor with KDE-PMF contour lines overlaid."""
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    svg_path = save_path.with_suffix(".svg")
+    png_path = save_path.with_suffix(".png")
+
+    rmsd_key = "Cα-RMSD to native (Å)"
+    q_key    = "Q (native contacts)"
+    hel_key  = "Helicity (res 2–8)"
+    com_key  = "Committor"
+
+    rmsd = np.asarray(colorings.get(rmsd_key, np.full(len(cvs), np.nan)), dtype=np.float64)
+    qval = np.asarray(colorings.get(q_key,    np.full(len(cvs), np.nan)), dtype=np.float64)
+    hel  = np.asarray(colorings.get(hel_key,  np.full(len(cvs), np.nan)), dtype=np.float64)
+    com  = colorings.get(com_key)
+    com  = (np.asarray(com, dtype=np.float64) if com is not None
+            else np.full(len(cvs), np.nan))
+
+    x, y = cvs[:, 0], cvs[:, 1]
+    cmap_top = "YlOrBr"
+
+    from matplotlib.ticker import MaxNLocator, FormatStrFormatter
+
+    cbar_label_size = max(1, int(round(_PUB_RC["axes.labelsize"] * 8 / 9)))
+    cbar_tick_size  = max(1, int(round(_PUB_RC["xtick.labelsize"] * 8 / 9)))
+
+    # Fixed-size axes in figure fractions: every panel has identical physical
+    # dimensions regardless of CV data range (no dynamic scaling). Display
+    # squareness comes from setting axes width = height in figure-fractions
+    # given figsize aspect, and aspect="auto" so data fills the box.
+    figsize = (20.0, 15.0)
+    fw, fh = figsize
+    # Top tile: 4×4 in plot + 0.2 in cbar
+    top_plot_w_in, top_plot_h_in = 4.0, 4.0
+    top_cbar_w_in, top_cbar_pad_in = 0.20, 0.18
+    bot_plot_w_in, bot_plot_h_in = 7.0, 7.0
+    bot_cbar_w_in, bot_cbar_pad_in = 0.35, 0.25
+    # Convert to fig fractions
+    tpw, tph = top_plot_w_in / fw, top_plot_h_in / fh
+    tcw, tcp = top_cbar_w_in / fw, top_cbar_pad_in / fw
+    bpw, bph = bot_plot_w_in / fw, bot_plot_h_in / fh
+    bcw, bcp = bot_cbar_w_in / fw, bot_cbar_pad_in / fw
+    left0 = 0.10
+    top_panel_gap_in = 1.6
+    tgap = top_panel_gap_in / fw
+    top_y0 = 0.68
+    bot_y0 = 0.10
+
+    with plt.rc_context(_PUB_RC):
+        fig = plt.figure(figsize=figsize)
+
+        def _add_panel(x0, y0, pw, ph, cw, cp):
+            ax = fig.add_axes([x0, y0, pw, ph])
+            cax = fig.add_axes([x0 + pw + cp, y0, cw, ph])
+            return ax, cax
+
+        x_top0 = left0
+        x_top1 = x_top0 + tpw + tcw + tcp + tgap
+        x_top2 = x_top1 + tpw + tcw + tcp + tgap
+        ax1, cax1 = _add_panel(x_top0, top_y0, tpw, tph, tcw, tcp)
+        ax2, cax2 = _add_panel(x_top1, top_y0, tpw, tph, tcw, tcp)
+        ax3, cax3 = _add_panel(x_top2, top_y0, tpw, tph, tcw, tcp)
+        ax_b, cax_b = _add_panel(left0, bot_y0, bpw, bph, bcw, bcp)
+
+        top_specs = [
+            (ax1, cax1, rmsd, rmsd_key, None, None, True),
+            (ax2, cax2, qval, q_key,    0.0,  1.0,  False),
+            (ax3, cax3, hel,  hel_key,  0.0,  1.0,  False),
+        ]
+        for ax, cax, vals, label, vmin, vmax, force_5_cbar in top_specs:
+            hb = _hexbin_coloring(ax, x, y, vals, cmap_top, vmin=vmin, vmax=vmax)
+            if hb is not None:
+                cbar = fig.colorbar(hb, cax=cax)
+                cbar.set_label(label, fontsize=cbar_label_size)
+                cbar.ax.tick_params(labelsize=cbar_tick_size)
+                if force_5_cbar:
+                    lo, hi = hb.get_clim()
+                    cbar.set_ticks(np.linspace(lo, hi, 5))
+                    cbar.ax.yaxis.set_major_formatter(FormatStrFormatter("%.1f"))
+                else:
+                    cbar.locator = MaxNLocator(5)
+                    cbar.update_ticks()
+            else:
+                cax.set_visible(False)
+            ax.set_xlabel("CV 1")
+            ax.tick_params(axis="x", labelrotation=30)
+            ax.xaxis.set_major_locator(MaxNLocator(5))
+            ax.yaxis.set_major_locator(MaxNLocator(5))
+        ax1.set_ylabel("CV 2")
+        # Force matching y-limits so hidden ticks on ax2/ax3 match ax1 visually.
+        for ax in (ax2, ax3):
+            ax.sharey(ax1)
+            ax.tick_params(axis="y", labelleft=False, left=False)
+            ax.set_ylabel("")
+
+        # Bottom: committor hexbin + KDE-PMF contour lines with kcal/mol labels.
+        hb_c = _hexbin_coloring(ax_b, x, y, com, "bwr", vmin=0.0, vmax=1.0,
+                                gridsize=55)
+        if hb_c is not None:
+            cbar = fig.colorbar(hb_c, cax=cax_b)
+            cbar.set_label("Committor", fontsize=cbar_label_size)
+            cbar.ax.tick_params(labelsize=cbar_tick_size)
+            cbar.set_ticks(np.linspace(0.0, 1.0, 5))
+        else:
+            cax_b.set_visible(False)
+        kde_out = _kde_F(x, y, kT=kT, kde_bw=kde_bw)
+        if kde_out is not None:
+            import matplotlib.patheffects as pe
+            X, Y, F = kde_out
+            F_masked = np.where((F <= max_F) & np.isfinite(F), F, np.nan)
+            levels = np.arange(1.0, max_F + 0.001, 1.0)
+            cs = ax_b.contour(X, Y, F_masked, levels=levels,
+                              colors="k", linewidths=2.2, alpha=0.9)
+            labels_c = ax_b.clabel(cs, inline=True, fontsize=22, fmt="%.0f")
+            for txt in labels_c:
+                txt.set_path_effects([
+                    pe.Stroke(linewidth=3.0, foreground="white"),
+                    pe.Normal(),
+                ])
+        # Cluster representatives — diamond markers numbered 1..N.
+        try:
+            from cv_playground.basins import find_basins_clustering
+            basins_cl = find_basins_clustering(cvs)
+        except Exception:
+            basins_cl = None
+        if basins_cl is not None and basins_cl.get("n_basins", 0) > 0:
+            import matplotlib.patheffects as pe
+            mins = np.asarray(basins_cl["minima"], dtype=np.float64)
+            ax_b.scatter(mins[:, 0], mins[:, 1], marker="D", s=900,
+                         facecolor="gold", edgecolor="black",
+                         linewidths=2.0, zorder=10)
+            for k, (cx, cy) in enumerate(mins, start=1):
+                t = ax_b.text(cx, cy, str(k), ha="center", va="center",
+                              fontsize=20, fontweight="bold",
+                              color="black", zorder=11)
+                t.set_path_effects([
+                    pe.Stroke(linewidth=2.5, foreground="white"),
+                    pe.Normal(),
+                ])
+
+        ax_b.set_xlabel("CV 1")
+        ax_b.set_ylabel("CV 2")
+        ax_b.tick_params(axis="x", labelrotation=30)
+        ax_b.xaxis.set_major_locator(MaxNLocator(5))
+        ax_b.yaxis.set_major_locator(MaxNLocator(5))
+
+        fig.savefig(str(svg_path))
+        fig.savefig(str(png_path), dpi=200)
+        plt.close(fig)
+    logger.info("Saved publication panel → %s", svg_path)
 
 
 def scatter_rg_q_by_cv(
@@ -400,14 +822,130 @@ def run_method(
     """Execute *func*, save multi-panel plot + .npy, score metrics if a run
     context is set, catch & log any exception."""
     try:
-        with timer(name):
-            cvs = func()
+        tag = name.lower().replace(" ", "_").replace("/", "_").replace("-", "_")
+        npy_path = Path(out_dir) / f"{tag}.npy"
+        args_ctx = _RUN_CTX.get("args")
+        read_mode = bool(args_ctx is not None and getattr(args_ctx, "read", False))
+        if read_mode:
+            if not npy_path.exists():
+                logger.warning("%s – cached %s not found; skipping (--read).",
+                               name, npy_path)
+                return None
+            logger.info("▶ %s – loading cached CV from %s", name, npy_path)
+            cvs = np.load(str(npy_path))
+        else:
+            with timer(name):
+                result = func()
+        transform_fn = None
+        pdp_kind = "distances"
+        if read_mode:
+            pass
+        elif isinstance(result, tuple) and len(result) == 2:
+            cvs, transform_fn = result
+        elif isinstance(result, tuple) and len(result) == 3:
+            cvs, transform_fn, pdp_kind = result
+        else:
+            cvs = result
         if cvs is None or cvs.ndim < 2 or cvs.shape[1] < 2:
             logger.warning("%s returned invalid CV array – skipping.", name)
             return None
-        tag = name.lower().replace(" ", "_").replace("/", "_").replace("-", "_")
+        # Drop any trailing cluster-id columns from a previous --read load
+        # before passing to plotting / scoring (first two columns are the CVs).
+        cvs_full = cvs
+        cvs = cvs_full[:, :2]
         scatter_cv(cvs, colorings, name, out_dir / f"{tag}.svg")
-        save_cv(cvs, out_dir / f"{tag}.npy")
+
+        # ── basin detection + representative-structure extraction ──────────
+        basins_ws = basins_cl = None
+        rep_pts: dict[str, np.ndarray] = {}
+        try:
+            from cv_playground.basins import (
+                find_basins_watershed, find_basins_clustering,
+                write_basin_pdbs, save_basin_summary,
+            )
+            kde_bw_val = getattr(args_ctx, "kde_bw", "scott") if args_ctx else "scott"
+            basins_ws = find_basins_watershed(cvs, kde_bw=kde_bw_val)
+            basins_cl = find_basins_clustering(cvs)
+            if basins_ws is not None:
+                rep_pts["watershed"] = basins_ws["minima"]
+            if basins_cl is not None:
+                rep_pts["clustering"] = basins_cl["minima"]
+            top_path = getattr(args_ctx, "top", None) if args_ctx else None
+            sel = getattr(args_ctx, "selection", "protein and name CA") \
+                if args_ctx else "protein and name CA"
+            feat_for_pdb = _RUN_CTX.get("feat")
+            if top_path and feat_for_pdb is not None:
+                prot_coords = getattr(feat_for_pdb, "protein_coords_3d", None)
+                prot_sel = getattr(feat_for_pdb, "protein_selection", "protein")
+                if basins_ws is not None:
+                    write_basin_pdbs(basins_ws, feat_for_pdb.coords_3d,
+                                     top_path, sel, tag,
+                                     Path(out_dir) / "basins" / "watershed",
+                                     protein_coords_3d=prot_coords,
+                                     protein_selection=prot_sel)
+                if basins_cl is not None:
+                    write_basin_pdbs(basins_cl, feat_for_pdb.coords_3d,
+                                     top_path, sel, tag,
+                                     Path(out_dir) / "basins" / "clustering",
+                                     protein_coords_3d=prot_coords,
+                                     protein_selection=prot_sel)
+            save_basin_summary(basins_ws, basins_cl,
+                               Path(out_dir) / "basins" / f"{tag}_basins.json")
+            # Sidecar: per-frame cluster IDs from both detectors
+            # columns = [watershed_id, hdbscan_id]; -1 = unassigned/noise
+            n_frames = cvs.shape[0]
+            clusters = np.full((n_frames, 2), -1, dtype=np.int64)
+            if basins_ws is not None and "assignments" in basins_ws:
+                a = np.asarray(basins_ws["assignments"])
+                if a.shape[0] == n_frames:
+                    clusters[:, 0] = a
+            if basins_cl is not None and "assignments" in basins_cl:
+                a = np.asarray(basins_cl["assignments"])
+                if a.shape[0] == n_frames:
+                    clusters[:, 1] = a
+            clusters_path = Path(out_dir) / "basins" / f"{tag}_clusters.npy"
+            clusters_path.parent.mkdir(parents=True, exist_ok=True)
+            np.save(str(clusters_path), clusters)
+        except Exception:
+            logger.warning("Basin detection failed for %s:\n%s",
+                           name, traceback.format_exc())
+
+        try:
+            fes_method = getattr(args_ctx, "fes_method", "kde") if args_ctx else "kde"
+            fes_kde_bw = getattr(args_ctx, "kde_bw", "scott") if args_ctx else "scott"
+            fes_contour(cvs, out_dir / f"{tag}_fes.svg",
+                        title=f"{name} — Free energy landscape",
+                        method=fes_method,
+                        kde_bw=fes_kde_bw,
+                        rep_points=rep_pts or None)
+        except Exception:
+            logger.warning("FES contour failed for %s:\n%s",
+                           name, traceback.format_exc())
+        if not read_mode:
+            save_cv(cvs, out_dir / f"{tag}.npy")
+            # Companion: CVs widened with the two cluster-id columns, so a
+            # single load gives you both projections and basin assignments.
+            try:
+                clusters_path = Path(out_dir) / "basins" / f"{tag}_clusters.npy"
+                if clusters_path.exists():
+                    cl = np.load(str(clusters_path))
+                    if cl.shape[0] == cvs.shape[0]:
+                        widened = np.column_stack([cvs, cl.astype(np.float64)])
+                        np.save(str(out_dir / f"{tag}_with_clusters.npy"), widened)
+            except Exception:
+                logger.warning("Failed to write %s widened-with-clusters .npy:\n%s",
+                               name, traceback.format_exc())
+        try:
+            feat_pub = _RUN_CTX.get("feat")
+            if feat_pub is not None and getattr(feat_pub, "colorings", None):
+                publication_panel(
+                    cvs, feat_pub.colorings,
+                    out_dir / f"{tag}_pub.svg",
+                    kde_bw=getattr(args_ctx, "kde_bw", "scott") if args_ctx else "scott",
+                )
+        except Exception:
+            logger.warning("Publication panel failed for %s:\n%s",
+                           name, traceback.format_exc())
         feat = _RUN_CTX.get("feat")
         args = _RUN_CTX.get("args")
         if feat is not None:
@@ -441,6 +979,78 @@ def run_method(
                 )
             except Exception:
                 logger.warning("Pearson interpret failed for %s:\n%s",
+                               name, traceback.format_exc())
+
+        # ── universal per-Cα importance: η² (always) + PDP (when transform_fn) ──
+        if feat is not None and getattr(feat, "distances", None) is not None:
+            try:
+                import csv
+                from cv_playground.interpret import (
+                    per_residue_eta2, per_residue_pdp, plot_residue_importance,
+                    pearson_pair, condmean_range_pair, _pair_to_residue,
+                )
+                eta2_res, pair_eta2 = per_residue_eta2(
+                    cvs, feat.distances, feat.n_atoms,
+                )
+                pair_pearson = pearson_pair(cvs, feat.distances)
+                pair_cmr = condmean_range_pair(cvs, feat.distances)
+                pearson_res = _pair_to_residue(pair_pearson, feat.n_atoms)
+                cmr_res = _pair_to_residue(pair_cmr, feat.n_atoms)
+
+                pdp_res = None
+                if transform_fn is not None and pdp_kind == "distances":
+                    top_n = min(30, pair_eta2.shape[0])
+                    top_ids = np.argsort(pair_eta2.max(axis=1))[-top_n:]
+                    pdp_out = per_residue_pdp(
+                        transform_fn, feat.distances, feat.n_atoms,
+                        top_pair_ids=top_ids,
+                    )
+                    if pdp_out is not None:
+                        pdp_res = pdp_out[0]
+                elif transform_fn is not None and pdp_kind == "cartesian":
+                    from cv_playground.interpret import per_residue_pdp_cartesian
+                    coords = getattr(feat, "coords_3d", None)
+                    if coords is not None and coords.ndim == 3:
+                        pdp_res = per_residue_pdp_cartesian(transform_fn, coords)
+
+                interpret_dir = Path(out_dir) / "interpret"
+                interpret_dir.mkdir(parents=True, exist_ok=True)
+                np.save(str(interpret_dir / f"{tag}_residue_eta2.npy"), eta2_res)
+                if pdp_res is not None:
+                    np.save(str(interpret_dir / f"{tag}_residue_pdp.npy"), pdp_res)
+
+                # Tidy CSV: one row per Cα, all importance scalars side by side.
+                n_a, n_cv = eta2_res.shape
+                csv_path = interpret_dir / f"{tag}_residue.csv"
+                with open(csv_path, "w", newline="") as fp:
+                    w = csv.writer(fp)
+                    cols = ["residue"]
+                    for k in range(n_cv):
+                        cols += [f"pearson_abs_cv{k+1}",
+                                 f"condmean_range_cv{k+1}",
+                                 f"eta2_cv{k+1}",
+                                 f"pdp_cv{k+1}"]
+                    w.writerow(cols)
+                    for i in range(n_a):
+                        row = [i]
+                        for k in range(n_cv):
+                            row.append(f"{pearson_res[i, k]:.6g}")
+                            row.append(f"{cmr_res[i, k]:.6g}")
+                            row.append(f"{eta2_res[i, k]:.6g}")
+                            pdp_v = (pdp_res[i, k]
+                                     if pdp_res is not None and k < pdp_res.shape[1]
+                                     else float("nan"))
+                            row.append(f"{pdp_v:.6g}")
+                        w.writerow(row)
+                logger.info("Saved per-Cα importance CSV → %s", csv_path)
+
+                plot_residue_importance(
+                    eta2_res, pdp_res,
+                    save_path=interpret_dir / f"{tag}_residue.svg",
+                    title=f"{name} — per-Cα importance",
+                )
+            except Exception:
+                logger.warning("Residue importance failed for %s:\n%s",
                                name, traceback.format_exc())
         return cvs
     except Exception:
@@ -549,7 +1159,7 @@ _METHOD_HYPERPARAMS: dict[str, str] = {
     "PCA on pairwise Cα distances":         "n_components=2 on 190-D Cα–Cα distance vector.",
     "Deep-tICA (mlcolvar)":                 "layers=[n_feat, 128, 64, 2], n_cvs=2, Adam default, epochs/batch from CLI.",
     "tICA (time-lagged independent components)": "dim=2, lag from --lag, input depends on script (distances or sin/cos dihedrals).",
-    "HLDA / Fisher LDA on distances":       "S_b v = λ S_w v with ε·I regularisation (ε=1e-6); labels from k-means(RMSD).",
+    "HLDA / Fisher LDA on distances":       "S_b v = λ S_w v with ε·I regularisation (ε=1e-6); labels from Q cuts (0.3 / 0.7) with k-means(RMSD) fallback.",
     "Deep-LDA (mlcolvar)":                  "layers=[n_feat, 128, 64, min(2, n_classes−1)], n_states from Q-labels.",
     "LDA on Q-based labels":                "PCA-50 pre-reduction → sklearn LDA; labels from Q cuts (0.3 / 0.7).",
     "Diffusion maps":                       "n_evecs=2, α=0.5, k=100 (Zheng–Rohrdanz–Clementi 2013 Trp-cage); ε = 'bgh' auto and 0.5·/1·/2·median² sweep.",
@@ -560,6 +1170,7 @@ _METHOD_HYPERPARAMS: dict[str, str] = {
     "Kernel PCA (RBF) on contacts":         "n_components=2, kernel='rbf', γ = 1 / (2·median ||x−x'||²) on contact maps.",
     "Time-lagged autoencoder":              "Encoder/decoder MLPs 128→64→2 / 2→64→128→n_feat, MSE(recon)+MSE(recon_lag)+0.5·MSE(z_t, z_lag).",
     "GraphVAMPnet (SchNet encoder)":        "SchNet hidden=32, num_filters=32, 3 interactions, 16 Gaussians, cutoff=7.5 Å; head 1→32→n. Sweep n ∈ {2, 5}. Loss = −VAMP-2. Defaults from Ghorbani, Hoffmann & Ferguson 2022 (Trp-cage benchmark).",
+    "GraphVAMPnet (paper SchNet)":          "Paper-faithful SchNet (Ghorbani/Hoffmann/Ferguson 2022, Table I): n_conv=4, h_a=16, 12 Gaussians in [2, 8] Å (step 0.5), residual, k-NN=min(7, n_atoms−1), n_classes=5, Adam lr=5e-4, batch_size=min(1000, max(16, --batch-size)).",
     "VAMPnet":                              "MLP lobe 5×100 (ELU) → n; deeptime VAMPNet lr=1e-3. Sweep n ∈ {2, 6}. Lobe width/depth from Mardt, Pasquali, Wu & Noé 2018 (Trp-cage benchmark).",
     "RAVE (time-lagged VAE)":               "Encoder 128→64→(μ, logσ²), predictor 2→64→128→n_feat; loss = MSE(x_{t+τ}, pred) + KL(q||N(0,I)).",
     "Variational autoencoder (bonus)":      "Encoder 128→64→(μ, logσ²), decoder 2→64→128→n_feat; ELBO = MSE(x, recon) + KL.",
@@ -569,13 +1180,20 @@ _METHOD_HYPERPARAMS: dict[str, str] = {
 }
 
 
-def _expl(what: str, usage: str, meaning: str, ref_title: str, ref_url: str) -> str:
-    """Compose a method explanation block: what / use in CV discovery / meaning / reference."""
+def _expl(what: str, usage: str, meaning: str, ref_prose: str,
+          refs: list[tuple[str, str]]) -> str:
+    """Compose a method explanation block: what / use in CV discovery / meaning /
+    prose citation / clickable short-labels (one per cited paper)."""
+    label = "References" if len(refs) > 1 else "Reference"
+    links = " &middot; ".join(
+        f"<a href='{url}' target='_blank'>{title}</a>" for title, url in refs
+    )
     return (
         f"<b>What it is.</b> {what}<br>"
         f"<b>Role in CV discovery.</b> {usage}<br>"
         f"<b>How to read the plot.</b> {meaning}<br>"
-        f"<b>Reference.</b> <a href='{ref_url}' target='_blank'>{ref_title}</a>"
+        f"<b>{label}.</b> {ref_prose}<br>"
+        f"<b>Link{'s' if len(refs) > 1 else ''}.</b> {links}"
     )
 
 
@@ -591,7 +1209,8 @@ _METHOD_EXPLANATIONS: list[tuple[tuple[str, ...], str, str]] = [
          "that separate folded from unfolded frames and track Q / RMSD.",
          "Amadei, Linssen & Berendsen 1993 — 'Essential dynamics of proteins' (Proteins). "
          "Trp-cage PCA: Juraszek & Bolhuis 2006, PNAS, 'Sampling the multiple folding mechanisms of Trp-cage in explicit solvent'.",
-         "https://doi.org/10.1073/pnas.0603229103",
+         [("Amadei 1993 (Proteins)", "https://doi.org/10.1002/prot.340170408"),
+          ("Juraszek & Bolhuis 2006 (PNAS)", "https://doi.org/10.1073/pnas.0603229103")],
      )),
     (("pca_internal",), "PCA on internal coordinates",
      _expl(
@@ -604,7 +1223,8 @@ _METHOD_EXPLANATIONS: list[tuple[tuple[str, ...], str, str]] = [
          "Mu, Nguyen & Stock 2005, Proteins, 'Energy landscape of a small peptide revealed by "
          "dihedral angle principal component analysis' (dPCA). Applied to Trp-cage dihedrals by "
          "Paschek, Hempel & García 2008, PNAS.",
-         "https://doi.org/10.1073/pnas.0805163105",
+         [("Mu, Nguyen & Stock 2005 (Proteins)", "https://doi.org/10.1002/prot.20310"),
+          ("Paschek, Hempel & García 2008 (PNAS)", "https://doi.org/10.1073/pnas.0805163105")],
      )),
     (("pca_distances",), "PCA on pairwise Cα distances",
      _expl(
@@ -615,7 +1235,7 @@ _METHOD_EXPLANATIONS: list[tuple[tuple[str, ...], str, str]] = [
          "folding typically shows the N-terminal helix / C-terminal polyproline contacts loading strongly.",
          "Juraszek & Bolhuis 2006, PNAS, 'Sampling the multiple folding mechanisms of Trp-cage in "
          "explicit solvent'.",
-         "https://doi.org/10.1073/pnas.0603229103",
+         [("Juraszek & Bolhuis 2006 (PNAS)", "https://doi.org/10.1073/pnas.0603229103")],
      )),
     (("deep_tica",), "Deep-tICA (mlcolvar)",
      _expl(
@@ -626,7 +1246,7 @@ _METHOD_EXPLANATIONS: list[tuple[tuple[str, ...], str, str]] = [
          "folded from unfolded basins with a clear transition region.",
          "Bonati, Piccini & Parrinello 2021, PNAS, 'Deep learning the slow modes for rare events "
          "sampling' — demonstrates Deep-TICA on Trp-cage folding.",
-         "https://doi.org/10.1073/pnas.2113533118",
+         [("Bonati, Piccini & Parrinello 2021 (PNAS)", "https://doi.org/10.1073/pnas.2113533118")],
      )),
     (("tica",), "tICA (time-lagged independent components)",
      _expl(
@@ -639,7 +1259,8 @@ _METHOD_EXPLANATIONS: list[tuple[tuple[str, ...], str, str]] = [
          "parameters for Markov model construction'. Trp-cage tICA: Schwantes & Pande 2013, JCTC, "
          "'Improvements in Markov state model construction reveal many non-native interactions in "
          "the folding of NTL9 and Trp-cage'.",
-         "https://doi.org/10.1021/ct300878a",
+         [("Pérez-Hernández et al. 2013 (JCP)", "https://doi.org/10.1063/1.4811489"),
+          ("Schwantes & Pande 2013 (JCTC)", "https://doi.org/10.1021/ct300878a")],
      )),
     (("hlda",), "HLDA / Fisher LDA on distances",
      _expl(
@@ -652,7 +1273,8 @@ _METHOD_EXPLANATIONS: list[tuple[tuple[str, ...], str, str]] = [
          "correct order parameter for the labelled transition.",
          "Mendels, Piccini & Parrinello 2018, J. Phys. Chem. Lett., 'Collective variables from local "
          "fluctuations' (HLDA). See also the Bonati et al. Trp-cage benchmark for the mlcolvar suite (2023).",
-         "https://doi.org/10.1021/acs.jpclett.8b00733",
+         [("Mendels, Piccini & Parrinello 2018 (JPC Lett)", "https://doi.org/10.1021/acs.jpclett.8b00733"),
+          ("Bonati et al. 2023 (mlcolvar, JCP)", "https://doi.org/10.1063/5.0156343")],
      )),
     (("deep_lda",), "Deep-LDA (mlcolvar)",
      _expl(
@@ -663,7 +1285,7 @@ _METHOD_EXPLANATIONS: list[tuple[tuple[str, ...], str, str]] = [
          "successful state-separating coordinate.",
          "Bonati, Rizzi & Parrinello 2020, J. Phys. Chem. Lett., 'Data-driven collective variables "
          "for enhanced sampling' — uses Trp-cage as one of the validation systems.",
-         "https://doi.org/10.1021/acs.jpclett.0c00535",
+         [("Bonati, Rizzi & Parrinello 2020 (JPC Lett)", "https://doi.org/10.1021/acs.jpclett.0c00535")],
      )),
     (("lda",), "LDA on Q-based labels",
      _expl(
@@ -674,7 +1296,7 @@ _METHOD_EXPLANATIONS: list[tuple[tuple[str, ...], str, str]] = [
          "against the more sophisticated methods in the metrics table.",
          "Piccini, Mendels & Parrinello 2018, JCTC, 'Metadynamics with discriminants: a tool for "
          "understanding chemistry'.",
-         "https://doi.org/10.1021/acs.jctc.8b00634",
+         [("Piccini, Mendels & Parrinello 2018 (JCTC)", "https://doi.org/10.1021/acs.jctc.8b00634")],
      )),
     (("diffusion_maps", "diffusionmap"), "Diffusion maps",
      _expl(
@@ -687,7 +1309,8 @@ _METHOD_EXPLANATIONS: list[tuple[tuple[str, ...], str, str]] = [
          "Rohrdanz, Zheng, Maggioni & Clementi 2011, J. Chem. Phys., 'Determination of reaction "
          "coordinates via locally scaled diffusion map'. Trp-cage application: Zheng, Rohrdanz & "
          "Clementi 2013, J. Phys. Chem. B.",
-         "https://doi.org/10.1021/jp401911h",
+         [("Rohrdanz et al. 2011 (JCP)", "https://doi.org/10.1063/1.3569857"),
+          ("Zheng, Rohrdanz & Clementi 2013 (JPC B)", "https://doi.org/10.1021/jp401911h")],
      )),
     (("laplacian",), "Laplacian eigenmaps",
      _expl(
@@ -698,7 +1321,7 @@ _METHOD_EXPLANATIONS: list[tuple[tuple[str, ...], str, str]] = [
          "basins indicate the embedding resolves the folding reaction.",
          "Das, Moll, Stamati, Kavraki & Clementi 2006, PNAS, 'Low-dimensional, free-energy "
          "landscapes of protein-folding reactions by nonlinear dimensionality reduction'.",
-         "https://doi.org/10.1073/pnas.0603553103",
+         [("Das et al. 2006 (PNAS)", "https://doi.org/10.1073/pnas.0603553103")],
      )),
     (("isomap",), "Isomap",
      _expl(
@@ -711,7 +1334,7 @@ _METHOD_EXPLANATIONS: list[tuple[tuple[str, ...], str, str]] = [
          "Das, Moll, Stamati, Kavraki & Clementi 2006, PNAS, 'Low-dimensional, free-energy "
          "landscapes of protein-folding reactions by nonlinear dimensionality reduction' "
          "— demonstrates Isomap on peptide folding landscapes relevant to Trp-cage-sized systems.",
-         "https://doi.org/10.1073/pnas.0603553103",
+         [("Das et al. 2006 (PNAS)", "https://doi.org/10.1073/pnas.0603553103")],
      )),
     (("lle",), "Locally Linear Embedding",
      _expl(
@@ -723,7 +1346,8 @@ _METHOD_EXPLANATIONS: list[tuple[tuple[str, ...], str, str]] = [
          "Isomap for global-versus-local sensitivity.",
          "Roweis & Saul 2000, Science, 'Nonlinear dimensionality reduction by Locally Linear "
          "Embedding'. Protein-folding application: Stamati, Clementi & Kavraki 2010, Proteins.",
-         "https://doi.org/10.1002/prot.22691",
+         [("Roweis & Saul 2000 (Science)", "https://doi.org/10.1126/science.290.5500.2323"),
+          ("Stamati, Clementi & Kavraki 2010 (Proteins)", "https://doi.org/10.1002/prot.22691")],
      )),
     (("umap",), "UMAP (visualization only)",
      _expl(
@@ -735,7 +1359,8 @@ _METHOD_EXPLANATIONS: list[tuple[tuple[str, ...], str, str]] = [
          "McInnes, Healy & Melville 2018, arXiv:1802.03426 — 'UMAP: Uniform Manifold Approximation "
          "and Projection for Dimension Reduction'. Trp-cage application: Trozzi, Wang & Tao 2021, "
          "J. Phys. Chem. B, 'UMAP as a dimensionality reduction tool for molecular dynamics simulations of biomacromolecules'.",
-         "https://doi.org/10.1021/acs.jpcb.1c02081",
+         [("McInnes, Healy & Melville 2018 (arXiv)", "https://arxiv.org/abs/1802.03426"),
+          ("Trozzi, Wang & Tao 2021 (JPC B)", "https://doi.org/10.1021/acs.jpcb.1c02081")],
      )),
     (("kernelpca",), "Kernel PCA (RBF) on contacts",
      _expl(
@@ -744,8 +1369,8 @@ _METHOD_EXPLANATIONS: list[tuple[tuple[str, ...], str, str]] = [
          "modes as Isomap/LLE without the need to build a k-NN graph.",
          "γ set from the median heuristic; CV1 should track global contact formation (high |r|_Q).",
          "Schölkopf, Smola & Müller 1998, Neural Computation, 'Nonlinear component analysis as a "
-         "kernel eigenvalue problem'. Protein-folding application: Antoniou & Schwartz 2011, JCTC.",
-         "https://doi.org/10.1162/089976698300017467",
+         "kernel eigenvalue problem'.",
+         [("Schölkopf, Smola & Müller 1998 (Neural Comput.)", "https://doi.org/10.1162/089976698300017467")],
      )),
     (("tae",), "Time-lagged autoencoder",
      _expl(
@@ -757,7 +1382,21 @@ _METHOD_EXPLANATIONS: list[tuple[tuple[str, ...], str, str]] = [
          "with Deep-TICA to check that the kinetic term is active.",
          "Wehmeyer & Noé 2018, J. Chem. Phys., 'Time-lagged autoencoders: Deep learning of slow "
          "collective variables for molecular kinetics'. Validated on Trp-cage and alanine dipeptide.",
-         "https://doi.org/10.1063/1.5011399",
+         [("Wehmeyer & Noé 2018 (JCP)", "https://doi.org/10.1063/1.5011399")],
+     )),
+    (("graphvampnet_paper_schnet", "paper_schnet"), "GraphVAMPnet (paper SchNet)",
+     _expl(
+         "GraphVAMPNet with the original Ghorbani–Hoffmann–Ferguson modified-SchNet lobe "
+         "(k-NN edges, residual interaction blocks, RBF distance expansion in [2, 8] Å).",
+         "Reproduces the paper-faithful Trp-cage configuration so the benchmark scores "
+         "are comparable to Ghorbani et al. 2022. Used to sanity-check our lighter-weight "
+         "GraphVAMPnet (SchNet encoder) variant.",
+         "Output is the 5-state soft assignment (only the first 2 columns are plotted); "
+         "class concentration along CV1 should match the folded/unfolded separation.",
+         "Ghorbani, Hoffmann & Ferguson 2022, J. Chem. Phys., 'GraphVAMPNet, using graph "
+         "neural networks to learn coarse-grained dynamics of molecular systems' — Table I "
+         "configuration for Trp-cage.",
+         [("Ghorbani, Hoffmann & Ferguson 2022 (JCP)", "https://doi.org/10.1063/5.0085607")],
      )),
     (("graphvampnet",), "GraphVAMPnet (SchNet encoder)",
      _expl(
@@ -769,7 +1408,7 @@ _METHOD_EXPLANATIONS: list[tuple[tuple[str, ...], str, str]] = [
          "Trp-cage the Trp6 indole residue typically dominates.",
          "Ghorbani, Hoffmann & Ferguson 2022, J. Chem. Phys., 'GraphVAMPNet, using graph neural "
          "networks to learn coarse-grained dynamics of molecular systems' — benchmarked on Trp-cage.",
-         "https://doi.org/10.1063/5.0085000",
+         [("Ghorbani, Hoffmann & Ferguson 2022 (JCP)", "https://doi.org/10.1063/5.0085607")],
      )),
     (("vampnet",), "VAMPnet",
      _expl(
@@ -780,7 +1419,7 @@ _METHOD_EXPLANATIONS: list[tuple[tuple[str, ...], str, str]] = [
          "resolution. A high VAMP-2 score implies informative slow CVs.",
          "Mardt, Pasquali, Wu & Noé 2018, Nature Communications, 'VAMPnets for deep learning of "
          "molecular kinetics' — validates VAMPnets on Trp-cage folding trajectories.",
-         "https://doi.org/10.1038/s41467-017-02388-1",
+         [("Mardt, Pasquali, Wu & Noé 2018 (Nature Commun.)", "https://doi.org/10.1038/s41467-017-02388-1")],
      )),
     (("rave",), "RAVE (time-lagged VAE)",
      _expl(
@@ -790,7 +1429,8 @@ _METHOD_EXPLANATIONS: list[tuple[tuple[str, ...], str, str]] = [
          "Latent μ is the CV; a clear bimodal distribution indicates a successful slow coordinate.",
          "Ribeiro, Bravo, Wang & Tiwary 2018, J. Chem. Phys., 'Reweighted autoencoded variational "
          "Bayes for enhanced sampling (RAVE)'. Trp-cage application: Wang, Ribeiro & Tiwary 2019, Nature Commun.",
-         "https://doi.org/10.1038/s41467-019-11405-4",
+         [("Ribeiro et al. 2018 (JCP)", "https://doi.org/10.1063/1.5025487"),
+          ("Wang, Ribeiro & Tiwary 2019 (Nature Commun.)", "https://doi.org/10.1038/s41467-019-11405-4")],
      )),
     (("vae",), "Variational autoencoder (bonus)",
      _expl(
@@ -801,7 +1441,7 @@ _METHOD_EXPLANATIONS: list[tuple[tuple[str, ...], str, str]] = [
          "the TAE plot for the effect of the time-lag term.",
          "Hernández, Wayment-Steele, Sultan, Husic & Pande 2018, Physical Review E, 'Variational "
          "encoding of complex dynamics' — applies a time-lagged VAE to Trp-cage.",
-         "https://doi.org/10.1103/PhysRevE.97.062412",
+         [("Hernández et al. 2018 (Phys. Rev. E)", "https://doi.org/10.1103/PhysRevE.97.062412")],
      )),
     (("egnn_autoencoder", "egnn"), "EGNN autoencoder",
      _expl(
@@ -812,7 +1452,8 @@ _METHOD_EXPLANATIONS: list[tuple[tuple[str, ...], str, str]] = [
          "expect Trp6 and the salt-bridge residues to dominate.",
          "Satorras, Hoogeboom & Welling 2021, ICML, 'E(n) Equivariant Graph Neural Networks'. "
          "Molecular CV usage: Ghorbani et al. 2022 (GraphVAMPNet) for Trp-cage.",
-         "https://proceedings.mlr.press/v139/satorras21a.html",
+         [("Satorras, Hoogeboom & Welling 2021 (ICML)", "https://proceedings.mlr.press/v139/satorras21a.html"),
+          ("Ghorbani, Hoffmann & Ferguson 2022 (JCP)", "https://doi.org/10.1063/5.0085607")],
      )),
     (("schnet_+_pca", "schnet_pca"), "SchNet + PCA",
      _expl(
@@ -823,7 +1464,7 @@ _METHOD_EXPLANATIONS: list[tuple[tuple[str, ...], str, str]] = [
          "embedding encodes most strongly.",
          "Schütt et al. 2018, J. Chem. Phys., 'SchNet – A deep learning architecture for molecules "
          "and materials'.",
-         "https://doi.org/10.1063/1.5019779",
+         [("Schütt et al. 2018 (JCP)", "https://doi.org/10.1063/1.5019779")],
      )),
     (("latent_tica",), "Latent-space tICA on EGNN embeddings",
      _expl(
@@ -835,7 +1476,8 @@ _METHOD_EXPLANATIONS: list[tuple[tuple[str, ...], str, str]] = [
          "Pérez-Hernández et al. 2013, J. Chem. Phys., 'Identification of slow molecular order "
          "parameters for Markov model construction' (tICA). Trp-cage GNN+tICA benchmark: "
          "Ghorbani et al. 2022 (GraphVAMPNet).",
-         "https://doi.org/10.1063/5.0085000",
+         [("Pérez-Hernández et al. 2013 (JCP)", "https://doi.org/10.1063/1.4811489"),
+          ("Ghorbani, Hoffmann & Ferguson 2022 (JCP)", "https://doi.org/10.1063/5.0085607")],
      )),
 ]
 
@@ -975,5 +1617,47 @@ def generate_summary_html(output_root: Path) -> Path:
 
     html_path.write_text("\n".join(parts))
     logger.info("Summary HTML → %s", html_path)
+    return html_path
+
+
+def generate_publication_html(output_root: Path) -> Path:
+    """Collect every ``*_pub.svg`` under *output_root* into
+    ``summary_publication.html`` — one image per analysis, no titles or
+    metrics, grouped by subsection."""
+    output_root = Path(output_root)
+    html_path = output_root / "summary_publication.html"
+    sections: dict[str, list[Path]] = {}
+    for svg in sorted(output_root.rglob("*_pub.svg")):
+        rel = svg.relative_to(output_root)
+        if len(rel.parts) < 2:
+            continue
+        sections.setdefault(rel.parts[0], []).append(svg)
+
+    parts = [
+        "<!DOCTYPE html><html><head><meta charset='utf-8'>",
+        "<title>CV Discovery – Publication Panels</title>",
+        "<style>",
+        "body{font-family:'CMU Serif','Computer Modern Roman',serif;"
+        "margin:32px;max-width:1400px}",
+        "h2{border-bottom:1px solid #888;padding-bottom:4px;"
+        "font-weight:normal;letter-spacing:0.02em}",
+        ".panel{margin:24px 0}",
+        ".panel img{max-width:100%;height:auto;display:block}",
+        ".panel small{display:block;margin-top:6px;color:#444;"
+        "font-family:monospace;font-size:12px}",
+        "</style></head><body>",
+    ]
+    for sec in sorted(sections):
+        nice = sec.replace("_", " ")
+        parts.append(f"<h2>{nice}</h2>")
+        for svg in sections[sec]:
+            uri = _svg_data_uri(svg)
+            parts.append(
+                f"<div class='panel'><img src='{uri}'/>"
+                f"<small>{svg.stem}</small></div>"
+            )
+    parts.append("</body></html>")
+    html_path.write_text("\n".join(parts))
+    logger.info("Publication HTML → %s", html_path)
     return html_path
 

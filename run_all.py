@@ -13,10 +13,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from cv_playground.io import featurize
+from cv_playground.io import featurize_cached
 from cv_playground.metrics import reset_metric_store
 from cv_playground.utils import (
     base_argparser,
+    generate_publication_html,
     generate_summary_html,
     setup_logging,
 )
@@ -55,7 +56,12 @@ def main() -> None:
     logger.info("Featurising trajectory once (top=%s  traj=%s  stride=%d)",
                 args.top, args.traj, args.stride)
     t0 = time.perf_counter()
-    feat = featurize(args.top, args.traj, args.stride, args.selection, native=args.native)
+    feat = featurize_cached(
+        args.top, args.traj, args.stride, args.selection,
+        native=args.native,
+        cache_dir=getattr(args, "cache_dir", "outputs/cache"),
+        read_cache=getattr(args, "read", False),
+    )
     logger.info("Featurisation finished in %.1f s (%d frames, %d atoms)",
                 time.perf_counter() - t0, len(feat.frame_indices), feat.n_atoms)
 
@@ -91,6 +97,8 @@ def main() -> None:
     if output_root.exists():
         html = generate_summary_html(output_root)
         logger.info("Open %s in a browser to compare results.", html)
+        pub_html = generate_publication_html(output_root)
+        logger.info("Publication panels → %s", pub_html)
     else:
         logger.warning(
             "Output directory %s does not exist – no summary generated.", output_root
