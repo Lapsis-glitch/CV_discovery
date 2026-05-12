@@ -189,6 +189,51 @@ TAE — Wehmeyer & Noé 2018 ([doi:10.1063/1.5011399](https://doi.org/10.1063/1.
 
 ## Recent updates
 
+### Per-Cα importance + cluster sidecars (universal across methods)
+Every method now emits per-Cα importance scalars and basin assignments
+alongside the CV array, with **no per-method opt-in required** for the
+data-driven metrics.
+
+- **Cluster IDs sidecar** → `outputs/<subsection>/basins/{tag}_clusters.npy`,
+  shape `(n_frames, 2)` columns `[watershed_id, hdbscan_id]`, `-1` = noise /
+  unassigned. A widened companion `{tag}_with_clusters.npy` =
+  `[CV1, CV2, watershed_id, hdbscan_id]` is also written so a single load
+  gives you projections + basins. The plain `{tag}.npy` is unchanged.
+- **Per-Cα importance CSV** → `outputs/<subsection>/interpret/{tag}_residue.csv`,
+  one row per Cα with four scalars per CV:
+  - `pearson_abs_cv{k}` — mean |Pearson(CV, pair-distance)| over partner
+    pairs; linear-baseline.
+  - `condmean_range_cv{k}` — `max_bin E[CV|bin] − min_bin E[CV|bin]`
+    averaged over partner pairs, in raw CV units. The conditional-mean
+    "swing" estimated from data.
+  - `eta2_cv{k}` — normalised variance of that conditional mean, ∈ [0, 1].
+    Universal nonlinear/non-monotonic importance; equals R² in the linear
+    case, exceeds Pearson² for nonlinear maps.
+  - `pdp_cv{k}` — model-based partial dependence (axis-sweep PDP querying
+    the trained encoder on synthetic inputs). NaN for methods whose encoder
+    has no clean out-of-sample `transform()`.
+- **Per-Cα importance plot** → `interpret/{tag}_residue.svg` — bar chart
+  per CV, η² (blue) and PDP (red) side-by-side when both exist.
+- **`.npy` artefacts** of the residue arrays:
+  `interpret/{tag}_residue_eta2.npy` (always) and
+  `interpret/{tag}_residue_pdp.npy` (when model PDP ran).
+
+#### Model-PDP coverage by method
+
+PDP queries the trained encoder at synthetic inputs, so it requires a
+callable `transform_fn`. Two PDP "spaces" are wired depending on each
+method's native input:
+
+| PDP space | Methods |
+|-----------|---------|
+| **Distances** (perturb one pair-distance over its 5–95 % quantile grid) | tICA / LDA / HLDA (01), PCA Distances / KernelPCA-contacts via contact threshold (02), Isomap / LLE (03), TAE / VAMPnet × 2 / Deep-tICA / Deep-LDA / VAE / RAVE (04) |
+| **Cartesian** (axis-sweep on each Cα's x/y/z, averaged over axes) | PCA Cartesian (01), EGNN-AE / SchNet+PCA / GraphVAMPnet (PyG) × 2 / GraphVAMPnet (paper SchNet) (05) |
+| **η² only** (no callable OOS transform) | PCA Internal (01), tICA-dihedrals / DiffusionMap+PCA (02), Diffusion Maps / Laplacian Eigenmaps / UMAP (03), Latent-tICA (05) |
+
+PDP defaults: `n_grid = 10`, `n_sub = 500`, distance PDP restricted to the
+top-30 pairs by η² to bound cost. Cartesian PDP is `n_atoms × 3` batched
+forward calls per method — ~1 s for PCA, ~1–3 min per GNN method on CPU.
+
 ### Free-energy landscape (FES) contours
 Every method now gets a dedicated `{tag}_fes.svg` next to its hexbin figure.
 

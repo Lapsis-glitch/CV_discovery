@@ -1,0 +1,29 @@
+TITLE     MDANALYSIS FRAME 0: Created by PDBWriter
+CRYST1    1.000    1.000    1.000  90.00  90.00  90.00 P 1           1
+REMARK     285 UNITARY VALUES FOR THE UNIT CELL AUTOMATICALLY SET
+REMARK     285 BY MDANALYSIS PDBWRITER BECAUSE UNIT CELL INFORMATION
+REMARK     285 WAS MISSING.
+REMARK     285 PROTEIN DATA BANK CONVENTIONS REQUIRE THAT
+REMARK     285 CRYST1 RECORD IS INCLUDED, BUT THE VALUES ON
+REMARK     285 THIS RECORD ARE MEANINGLESS.
+ATOM      1  CA  ASP X   1      -2.218   1.661  16.125  1.00  0.00      C1      
+ATOM      2  CA  ALA X   2       0.743   1.832  13.774  1.00  0.00      C1      
+ATOM      3  CA  TYR X   3       1.692   3.823  10.724  1.00  0.00      C1      
+ATOM      4  CA  ALA X   4       1.702   1.385   7.717  1.00  0.00      C1      
+ATOM      5  CA  GLN X   5       0.353   1.357   4.128  1.00  0.00      C1      
+ATOM      6  CA  TRP X   6      -2.626  -0.862   3.274  1.00  0.00      C1      
+ATOM      7  CA  LEU X   7      -2.860  -3.416   0.440  1.00  0.00      C1      
+ATOM      8  CA  ALA X   8      -5.487  -2.452  -2.173  1.00  0.00      C1      
+ATOM      9  CA  ASP X   9      -6.777  -4.141  -5.410  1.00  0.00      C1      
+ATOM     10  CA  GLY X  10      -6.374  -2.485  -8.803  1.00  0.00      C1      
+ATOM     11  CA  GLY X  11      -4.094   0.313  -9.918  1.00  0.00      C1      
+ATOM     12  CA  PRO X  12      -4.416   3.991  -9.006  1.00  0.00      C1      
+ATOM     13  CA  SER X  13      -7.791   5.809  -8.708  1.00  0.00      C1      
+ATOM     14  CA  SER X  14      -6.910   8.393 -11.324  1.00  0.00      C1      
+ATOM     15  CA  GLY X  15      -7.534   6.701 -14.802  1.00  0.00      C1      
+ATOM     16  CA  ARG X  16      -8.264   8.797 -17.954  1.00  0.00      C1      
+ATOM     17  CA  PRO X  17      -8.784  12.614 -17.945  1.00  0.00      C1      
+ATOM     18  CA  PRO X  18     -12.641  13.587 -18.061  1.00  0.00      C1      
+ATOM     19  CA  PRO X  19     -14.428  13.760 -21.460  1.00  0.00      C1      
+ATOM     20  CA  SER X  20     -12.957  16.295 -23.835  1.00  0.00      C1      
+END

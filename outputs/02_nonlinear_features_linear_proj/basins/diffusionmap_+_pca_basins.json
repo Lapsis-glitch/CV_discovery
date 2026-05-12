@@ -1,0 +1,15 @@
+{
+  "watershed": {
+    "n_basins": 1,
+    "minima": [
+      [
+        0.6019229366906416,
+        -0.12036315317878632
+      ]
+    ],
+    "rep_frame_idx": [
+      0
+    ]
+  },
+  "clustering": null
+}

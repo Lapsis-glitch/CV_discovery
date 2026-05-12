@@ -1,0 +1,10 @@
+/.claude/
+/CLAUDE.md
+/SI.tex
+/outputs/vmd.vmd
+/outputs/summary_publication.html
+/outputs/summary.html
+__pycache__/
+*.pyc
+/outputs/wide/
+*.xml
