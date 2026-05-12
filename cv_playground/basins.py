@@ -297,6 +297,89 @@ def write_basin_pdbs(basins: dict, coords_3d: np.ndarray,
     return written
 
 
+def write_basin_cluster_dcds(basins: dict, coords_3d: np.ndarray,
+                             top_path: str, selection: str,
+                             tag: str, out_dir: str | Path,
+                             *,
+                             protein_coords_3d: np.ndarray | None = None,
+                             protein_selection: str = "protein",
+                             n_samples: int = 50,
+                             seed: int = 42) -> list[Path]:
+    """Write one DCD per basin: up to ``n_samples`` random frames drawn from
+    the frames assigned to that basin.
+
+    Mirrors :func:`write_basin_pdbs` — prefers the full-protein coords when
+    available so the per-cluster DCD contains every protein atom (heavy + H)
+    instead of just Cα. Falls back to the CV-selection coords otherwise.
+    Frames with assignment ``-1`` (watershed: outside the valid FES region,
+    HDBSCAN: noise) are skipped. Clusters smaller than ``n_samples`` yield a
+    DCD with all of their frames. Frame indices are sorted before writing so
+    each DCD is a chronological subsample of its cluster.
+    """
+    import MDAnalysis as mda
+    from MDAnalysis.coordinates.memory import MemoryReader
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    use_full = (protein_coords_3d is not None
+                and protein_coords_3d.ndim == 3
+                and protein_coords_3d.shape[1] > 0
+                and protein_coords_3d.shape[0] == coords_3d.shape[0])
+
+    u = mda.Universe(top_path)
+    if use_full:
+        write_sel = protein_selection
+        write_coords = protein_coords_3d
+    else:
+        write_sel = selection
+        write_coords = coords_3d
+
+    ag = u.select_atoms(write_sel)
+    if len(ag) != write_coords.shape[1]:
+        logger.warning(
+            "Selection '%s' has %d atoms but cached coords have %d — "
+            "skipping basin DCD writing for %s.",
+            write_sel, len(ag), write_coords.shape[1], tag,
+        )
+        return []
+
+    # Build a fresh universe containing only the selected atoms so the DCD's
+    # atom count matches the topology a downstream viewer would load alongside.
+    sub = mda.Merge(ag)
+    n_atoms = sub.atoms.n_atoms
+
+    assignments = np.asarray(basins["assignments"])
+    rng = np.random.default_rng(int(seed))
+
+    written: list[Path] = []
+    for k in range(basins["n_basins"]):
+        in_basin = np.where(assignments == k)[0]
+        if in_basin.size == 0:
+            continue
+        n_pick = int(min(n_samples, in_basin.size))
+        picked = np.sort(
+            rng.choice(in_basin, size=n_pick, replace=False)
+        )
+        pos = np.ascontiguousarray(
+            write_coords[picked].astype(np.float32, copy=False)
+        )
+        sub.load_new(pos, format=MemoryReader, order="fac")
+
+        cv1, cv2 = (float(x) for x in basins["minima"][k])
+        path = out_dir / f"{tag}_{cv1:.3f}_{cv2:.3f}_{k}_samples.dcd"
+        with mda.Writer(str(path), n_atoms=n_atoms) as W:
+            for _ in sub.trajectory:
+                W.write(sub.atoms)
+        written.append(path)
+
+    logger.info(
+        "Wrote %d %s cluster DCDs (≤%d frames each) for %s → %s",
+        len(written), basins["method"], n_samples, tag, out_dir,
+    )
+    return written
+
+
 def save_basin_summary(basins_ws: dict | None, basins_cl: dict | None,
                        save_path: str | Path) -> None:
     """Write a JSON snapshot of basin minima / centroids and rep frame indices."""

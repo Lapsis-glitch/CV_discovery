@@ -79,6 +79,14 @@ def base_argparser(description: str = "") -> argparse.ArgumentParser:
                         "contour plot. 'kde' (default) uses Gaussian KDE on a "
                         "fine grid — smooth P(x, y) with no empty-bin "
                         "artifacts. 'hist' falls back to a 2-D histogram.")
+    p.add_argument("--cluster-samples", type=int, default=50,
+                   dest="cluster_samples",
+                   help="Per-cluster frame samples written as DCD trajectories "
+                        "alongside the basin representative PDBs. Each DCD "
+                        "contains a random (seeded by --seed) subsample of the "
+                        "frames assigned to that cluster, with full TRP-cage "
+                        "atoms when protein coords are cached. 0 disables. "
+                        "(default 50)")
     p.add_argument("--kde-bw", default="0.25", dest="kde_bw",
                    help="Gaussian-KDE bandwidth for the FES contour plot. "
                         "Pass a float (smaller = sharper basins, larger = "
@@ -861,7 +869,8 @@ def run_method(
         try:
             from cv_playground.basins import (
                 find_basins_watershed, find_basins_clustering,
-                write_basin_pdbs, save_basin_summary,
+                write_basin_pdbs, write_basin_cluster_dcds,
+                save_basin_summary,
             )
             kde_bw_val = getattr(args_ctx, "kde_bw", "scott") if args_ctx else "scott"
             basins_ws = find_basins_watershed(cvs, kde_bw=kde_bw_val)
@@ -889,6 +898,28 @@ def run_method(
                                      Path(out_dir) / "basins" / "clustering",
                                      protein_coords_3d=prot_coords,
                                      protein_selection=prot_sel)
+                n_samples = int(getattr(args_ctx, "cluster_samples", 50)
+                                if args_ctx else 50)
+                seed = int(getattr(args_ctx, "seed", 42) if args_ctx else 42)
+                if n_samples > 0:
+                    if basins_ws is not None:
+                        write_basin_cluster_dcds(
+                            basins_ws, feat_for_pdb.coords_3d,
+                            top_path, sel, tag,
+                            Path(out_dir) / "basins" / "watershed",
+                            protein_coords_3d=prot_coords,
+                            protein_selection=prot_sel,
+                            n_samples=n_samples, seed=seed,
+                        )
+                    if basins_cl is not None:
+                        write_basin_cluster_dcds(
+                            basins_cl, feat_for_pdb.coords_3d,
+                            top_path, sel, tag,
+                            Path(out_dir) / "basins" / "clustering",
+                            protein_coords_3d=prot_coords,
+                            protein_selection=prot_sel,
+                            n_samples=n_samples, seed=seed,
+                        )
             save_basin_summary(basins_ws, basins_cl,
                                Path(out_dir) / "basins" / f"{tag}_basins.json")
             # Sidecar: per-frame cluster IDs from both detectors
