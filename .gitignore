@@ -8,3 +8,5 @@ __pycache__/
 *.pyc
 /outputs/wide/
 *.xml
+/cv_playground/plots.py
+/cv_playground/figures/
